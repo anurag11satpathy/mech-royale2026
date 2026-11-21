@@ -2,7 +2,7 @@
 
 All logging goes to stderr (mf.log). Reads only data/map.bin (shipped) and writes nothing to disk.
 """
-import math, os, random, time
+import gc, math, os, random, time
 from collections import deque
 
 import mechfight as mf
@@ -36,7 +36,8 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v3"
+    name = "anurag-v4"
+    USE_ISO = False      # isolation positioning vs 2+ pursuers: built, but lost to plain duelling in squad_sim (v4)
 
     def __init__(self, hello):
         self.cfg = cfg = hello["config"]
@@ -81,8 +82,18 @@ class Bot:
         self.crates = {}            # id -> [x, y, z, hp, t_seen]
         self.npc_mem = {}           # id -> [x, y, z, t_seen]
         self.farm = None            # (kind, id) we are working on in ROAM
+        self.enemy_weapons = {}     # mech id -> set of weapon kinds seen
+        self.iso = None             # isolation spot (x, y, z, n_visible, visible_id)
+        self.iso_t = -99.0
+        self.evade_until = 0.0
+        self.evade_dir = (0.0, 0.0)
+        self.jit_sign = 1
+        self.jit_until = 0.0
         self.times = []
         self.n = 0
+        # The map grids are big lists the GC would otherwise rescan on every full collection (~2 ms+).
+        gc.collect()
+        gc.freeze()
 
     # ------------------------------------------------------------------ helpers
     def zone_at(self, z, t):
@@ -126,6 +137,84 @@ class Bot:
                         self.steer_side = sgn
                     return c * m, sn * m
         return -vx, -vy
+
+    def wpref(self, kind):
+        """Weapon preference, shifted by what the squad carries (laser beats mortar, lightning beats laser)."""
+        if kind is None:
+            return -1.0
+        v = WEAPON_PREF.get(kind, 0.0)
+        cnt = {"laser": 0, "mortar": 0, "lightning": 0}
+        for ws in self.enemy_weapons.values():
+            for k in ws:
+                if k in cnt:
+                    cnt[k] += 1
+        if kind == "laser":
+            v += 0.15 * cnt["mortar"] - 0.15 * cnt["lightning"]
+        elif kind == "lightning":
+            v += 0.25 * cnt["laser"]
+        return v
+
+    def find_iso(self, x, y, z, foes, focus_id, reloading):
+        """Isolation spot: a ground or rooftop point that exactly ONE pursuer can see (ideally the focus target,
+        which we must be able to shoot back at), or none while reloading. High ground is preferred.
+        foes: list of (id, fx, fy, fz, center_z)."""
+        g = self.geo
+        los = g.los
+        self.heavy = True
+        cx = sum(f[1] for f in foes) / len(foes) - x
+        cy = sum(f[2] for f in foes) / len(foes) - y
+        cd = math.hypot(cx, cy) or 1.0
+        cx, cy = cx / cd, cy / cd
+        foe_ground = sum(f[3] for f in foes) / len(foes)
+        cands = [(x, y, z, 0.0, 0.0)]
+        off = self.rng.random() * TAU / 12
+        for r in (7.0, 14.0, 22.0, 32.0):
+            for k in range(12):
+                a = off + k * TAU / 12
+                ux, uy = math.cos(a), math.sin(a)
+                px, py = x + ux * r, y + uy * r
+                c = g.cell(px, py)
+                if c < 0:
+                    continue
+                toward = ux * cx + uy * cy
+                top = g.T[c]
+                if g.NAV[g.ncell(px, py)]:
+                    cands.append((px, py, g.G[c], r, toward))
+                elif top > g.G[c] + 3.0 and top - z < 20.0 and g.B[c] <= g.G[c] + 1.0:
+                    cands.append((px, py, top, r, toward))   # rooftop high ground
+        best, bs = None, 1e18
+        checks = 0
+        for px, py, pz, r, toward in cands:
+            if checks > 56:
+                break
+            sc0 = r * (1.0 + 1.2 * max(0.0, toward)) + max(0.0, pz - z) * 0.4
+            sc0 -= min(max(pz - foe_ground, 0.0), 20.0) * 0.6          # high ground bonus
+            if sc0 - 12.0 >= bs or not self.zone_ok(px, py, 10.0, 8.0):
+                continue
+            checks += 1
+            vis_ids = []
+            for f in foes:
+                if los(f[1], f[2], f[3] + 8.0, px, py, pz + 8.8):
+                    vis_ids.append(f[0])
+                    if len(vis_ids) > 1:
+                        break
+            n = len(vis_ids)
+            if n >= 2:
+                continue
+            sc = sc0
+            if n == 1:
+                f = next(q for q in foes if q[0] == vis_ids[0])
+                if not los(px, py, pz + 7.0, f[1], f[2], f[4]):
+                    sc += 25.0         # it sees us but we can't hit it
+                if vis_ids[0] == focus_id:
+                    sc -= 6.0
+                if reloading:
+                    sc += 10.0
+            else:
+                sc += 0.0 if reloading else 12.0
+            if sc < bs:
+                bs, best = sc, (px, py, pz, n, vis_ids[0] if n else None)
+        return best
 
     def start_climb(self, t, ux, uy, dur=2.5):
         self.climb_start = t
@@ -238,7 +327,7 @@ class Bot:
             if v2 < 1:
                 continue
             tc = (rx * ux + ry * uy + rz * uz) / v2
-            if tc <= 0 or tc > 1.0:
+            if tc <= 0 or tc > 1.2:
                 continue
             cx, cy = rx - ux * tc, ry - uy * tc
             miss = math.hypot(cx, cy)
@@ -247,8 +336,8 @@ class Bot:
                 hv = math.hypot(ux, uy) or 1.0
                 perx, pery = -uy / hv, ux / hv
                 sgn = 1.0 if (cx * perx + cy * pery) >= 0 else -1.0
-                vx += perx * sgn * 0.8
-                vy += pery * sgn * 0.8
+                vx += perx * sgn * 1.0
+                vy += pery * sgn * 1.0
         return vx, vy
 
     # ------------------------------------------------------------------ cover
@@ -565,16 +654,23 @@ class Bot:
         lightning = slots.get("lightning")
         mortar = slots.get("mortar")
 
-        # ---------------- target selection
+        for e in enemies:
+            ws = e[0].get("weapons")
+            if ws:
+                self.enemy_weapons.setdefault(e[0]["id"], set()).update(ws)
+
+        # ---------------- target selection: focus the exposed enemy we can kill fastest
+        cubes_ = me.get("cubes", 0)
+        base_dps = 95.0 * (1 + 0.04 * min(cubes_, 10)) + (90.0 if laser else 0.0)
         target = None
-        cur = None
         best = 1e18
         for e in enemies:
             m, d, vis, ch = e
-            sc = d + m.get("hp", 1400) * 0.06 - (70 if vis else 0)
+            sc = m.get("hp", 1400) / base_dps + d / 150.0 + (0.0 if vis else 4.0) + (0.0 if d < 230 else 5.0)
+            if lightning and d < 45:
+                sc -= 1.5
             if m["id"] == self.target_id:
-                cur = e
-                sc *= 0.75
+                sc -= 1.0   # stickiness: don't flip-flop between similar targets
             if sc < best:
                 best, target = sc, e
         if target:
@@ -680,12 +776,47 @@ class Bot:
             if finishable:
                 R = min(R, 70.0)   # close in and keep firing
                 label = "FINISH"
-            reloading = gun and gun[1].get("reload", 0) > 0
+            reloading = bool(gun and gun[1].get("reload", 0) > 0)
+            foes = sorted(((e[0]["id"], e[0]["pos"][0], e[0]["pos"][1], e[0]["pos"][2], e[3])
+                           for e in enemies if e[1] < 220), key=lambda f: (f[1] - x) ** 2 + (f[2] - y) ** 2)[:4]
+            # isolate only when we are actually exposed to 2+ (or were just hit by 2+); one pursuer in view is a duel
+            n_hit2 = len({d_[2] for d_ in self.dmg_log if t - d_[0] < 2.0 and d_[2] is not None})
+            multi = self.USE_ISO and len(foes) >= 2 and not finishable and \
+                (n_los >= 2 or n_hit2 >= 2 or (self.iso is not None and t - self.iso_t < 2.5))
             pv = None
-            if d > 50 and frac > 0.35 and n_los <= 2 and (laser or gun) and not lightning_close(lightning, d) \
-                    and not finishable and not winning:
+            iso_mv = None
+            if multi:
+                # slice the pie: stand where only one pursuer can see us (rooftops count)
+                need = self.iso is None or t - self.iso_t > 0.8 or n_los >= 2 or \
+                    (self.iso[3] == 0) != reloading
+                if need and t - self.iso_t > 0.3:
+                    self.iso = self.find_iso(x, y, z, foes, m["id"], reloading)
+                    self.iso_t = t
+                if self.iso:
+                    ix, iy, iz, nv, vid = self.iso
+                    dd = math.hypot(ix - x, iy - y)
+                    label = "ISO-%d" % nv
+                    if dd > 2.5 or iz > z + 3.0:
+                        mvx, mvy, jn = self.go_to(x, y, z, ix, iy, iz, me)
+                        jump = jump or jn
+                        want_boost = dd > 10 and me["energy"] > 45 and iz <= z + 3.0
+                    else:
+                        # hold the spot with a small side-to-side jitter so lead shots miss
+                        if t > self.jit_until:
+                            self.jit_sign = -self.jit_sign
+                            self.jit_until = t + self.rng.uniform(0.35, 0.9)
+                        ux, uy = (tx - x) / (d or 1), (ty - y) / (d or 1)
+                        mvx = -uy * self.jit_sign * 0.7 + (ix - x) / 2.5
+                        mvy = ux * self.jit_sign * 0.7 + (iy - y) / 2.5
+                    iso_mv = (mvx, mvy)
+            else:
+                self.iso = None
+            if iso_mv is None and d > 50 and frac > 0.35 and n_los <= 1 and (laser or gun) and \
+                    not lightning_close(lightning, d) and not finishable and not winning and not multi:
                 pv = self.peek_move(x, y, z, me, target, threats, laser, gun)
-            if pv is not None:
+            if iso_mv is not None:
+                pass
+            elif pv is not None:
                 self.peek_active = True
                 mvx, mvy = pv
                 label = "PEEK-" + self.peek["phase"]
@@ -694,10 +825,11 @@ class Bot:
             elif vis or d < 60:
                 if t > self.strafe_until:
                     self.strafe_sign = self.rng.choice((-1, 1))
-                    self.strafe_until = t + self.rng.uniform(0.7, 2.0)
+                    self.strafe_until = t + self.rng.uniform(0.4, 1.3)   # short, irregular jukes
+                    self.strafe_mag = self.rng.uniform(0.6, 1.0)
                 ux, uy = (tx - x) / (d or 1), (ty - y) / (d or 1)
                 radial = clamp((d - R) / 60.0, -1.0, 1.0)
-                strafe = 0.85
+                strafe = getattr(self, "strafe_mag", 0.85)
                 if m.get("charging"):
                     strafe = 1.0  # their laser is up: juke hard
                 if reloading and not (laser or lightning or mortar) and d > 45:
@@ -738,7 +870,7 @@ class Bot:
                 if kind == "cube":
                     v = 4.0
                 else:
-                    if kind in slots or WEAPON_PREF.get(kind, 0) <= WEAPON_PREF.get(slot1_kind, -1):
+                    if kind in slots or self.wpref(kind) <= self.wpref(slot1_kind):
                         continue
                     v = 6.0 + (4.0 if kind == "laser" else 0.0)
                 v /= (1.0 + dd / 45.0)
@@ -793,6 +925,20 @@ class Bot:
                     want_boost = nd > 90 and me["energy"] > 60
                 # else: already in a good spot: stand still (silent)
 
+        # ---------------- evasion: a charged laser aimed at us -> sidestep burst
+        if self.state in ("DUEL", "HEAL") and not zone_urgent:
+            for e in enemies:
+                em = e[0]
+                if em.get("charging") and e[2] and e[1] < 300 and t > self.evade_until:
+                    brg = math.atan2(y - em["pos"][1], x - em["pos"][0])
+                    if abs(wrap(em.get("aim", [9, 0])[0] - brg)) < 0.15:
+                        sg = self.rng.choice((-1, 1))
+                        self.evade_dir = (-math.sin(brg) * sg, math.cos(brg) * sg)
+                        self.evade_until = t + 0.6
+            if t < self.evade_until:
+                mvx, mvy = mvx * 0.3 + self.evade_dir[0], mvy * 0.3 + self.evade_dir[1]
+                want_boost = True
+
         # ---------------- zone bias & dodge
         if not zone_urgent:
             px, py = x + mvx * 25, y + mvy * 25
@@ -808,7 +954,9 @@ class Bot:
 
         # ---------------- stuck detection
         wanted = math.hypot(mvx, mvy) > 0.5
-        self.hist.append((t, x, y, wanted))
+        self.hist.append((t, x, y, wanted, math.atan2(mvy, mvx)))
+        # no automatic climbing while someone can shoot us (a jetting mech is a free target)
+        exposed_fight = n_los > 0 and self.state == "DUEL" and not zone_urgent
         while self.hist and t - self.hist[0][0] > 1.2:
             self.hist.popleft()
         climbing = False
@@ -825,7 +973,7 @@ class Bot:
             want_boost = True
         else:
             m_ = math.hypot(mvx, mvy)
-            if m_ > 0.5 and me["grounded"]:
+            if m_ > 0.5 and me["grounded"] and not exposed_fight:
                 ux, uy = mvx / m_, mvy / m_
                 rise = self.rise_ahead(x, y, z, ux, uy)
                 # terrain bank (not a building) right ahead: hop it instead of sliding along it
@@ -833,14 +981,17 @@ class Bot:
                     self.start_climb(t, ux, uy)
                     climbing, jump = True, True
                     mvx, mvy = ux, uy
-            if not climbing and wanted and len(self.hist) >= 10 and all(h[3] for h in self.hist) and \
+            cur_dir = math.atan2(mvy, mvx)
+            # stuck = pushing the same way for 1.2 s without moving (strafe flip-flops are not stuck)
+            if not climbing and wanted and len(self.hist) >= 10 and \
+                    all(h[3] and (self.state == "ROAM" or abs(wrap(h[4] - cur_dir)) < 1.2) for h in self.hist) and \
                     math.hypot(self.hist[0][1] - x, self.hist[0][2] - y) < 2.0:
                 self.stuck_count += 1
                 self.path_t = -99.0
                 self.hist.clear()
                 ux, uy = mvx / (m_ or 1), mvy / (m_ or 1)
                 rise = self.rise_ahead(x, y, z, ux, uy)
-                if self.stuck_count % 2 == 1 and me["energy"] > 35 and rise < 55:
+                if self.stuck_count % 2 == 1 and me["energy"] > 35 and rise < 55 and not exposed_fight:
                     self.start_climb(t, ux, uy)
                     climbing, jump = True, True
                     mvx, mvy = ux, uy
@@ -903,6 +1054,7 @@ class Bot:
             rad = 2.5 if m.get("id", 0) < 100 else 1.8
             on_target = abs(wrap(ay - yaw)) * hd < rad * 0.8 + 0.4 and abs(ap - pitch) * hd < 3.0
             in_heal = self.state == "HEAL" and not under_fire and d > 50
+            rush = any(e[1] < 40 for e in enemies)
 
             # laser: charge when it can see, release at full charge on target
             if laser and not in_heal:
@@ -913,9 +1065,12 @@ class Bot:
                 direct_pitch = math.atan2(ch - muz_z, max(d, 1.0))
                 if charge > 0:
                     aim_yaw, aim_pitch = direct_yaw, direct_pitch
-                    on_l = abs(wrap(ay - direct_yaw)) * max(d, 1) < rad * 0.7 and \
+                    tol = rad * (1.0 if charge > full + 0.4 else 0.7)
+                    on_l = abs(wrap(ay - direct_yaw)) * max(d, 1) < tol and \
                         abs(ap - direct_pitch) * max(d, 1) < 3.0
                     hold = charge < full * 0.98 or not (on_l and los_shot)
+                    if rush and charge >= lw["stats"].get("min_charge", 0.15) and on_l and los_shot:
+                        hold = False   # they're on top of us: take the partial shot and get mobile
                     if self.laser_hold_t is not None and t - self.laser_hold_t > full + 1.7:
                         hold = False  # release before the forced auto-fire
                         if not los_shot:
@@ -928,7 +1083,7 @@ class Bot:
                     if not hold:
                         self.laser_hold_t = None
                         self.laser_fired_t = t
-                elif lw.get("cooldown", 0) <= 0 and d < lw["stats"]["range"] * 0.95 and (
+                elif lw.get("cooldown", 0) <= 0 and d < lw["stats"]["range"] * 0.95 and not rush and (
                         los_shot or (self.peek_active and self.peek["phase"] == "cover"
                                      and math.hypot(self.peek["C"][0] - x, self.peek["C"][1] - y) < 4.0)):
                     self.laser_hold_t = t
@@ -1024,7 +1179,7 @@ class Bot:
                 if w1 is None:
                     act["take"] = p["id"]
                     break
-                if WEAPON_PREF.get(k, 0) > WEAPON_PREF.get(w1["kind"], 0) and not (w1["kind"] == "laser" and (w1.get("charge") or 0) > 0):
+                if self.wpref(k) > self.wpref(w1["kind"]) + 0.2 and not (w1["kind"] == "laser" and (w1.get("charge") or 0) > 0):
                     act["take"] = p["id"]
                     act["drop"] = 1
                     break
