@@ -13,8 +13,8 @@ PI = math.pi
 TAU = 2 * math.pi
 
 UPGRADE_PRIORITY = [
-    "armor", "plating", "nanites", "gyros", "laser_charge", "laser_damage", "lightning_efficiency",
-    "gun_damage", "gun_rate", "servos", "gun_mag", "capacitor", "jets", "reactor", "lightning_range",
+    "armor", "plating", "nanites", "laser_damage", "gun_damage", "laser_charge", "gun_rate",
+    "lightning_efficiency", "gyros", "servos", "gun_mag", "capacitor", "jets", "reactor", "lightning_range",
     "sensors", "gun_velocity", "lightning_chain", "mortar_reload", "mortar_velocity", "mortar_splash",
     "laser_pierce",
 ]
@@ -36,7 +36,7 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v2"
+    name = "anurag-v3"
 
     def __init__(self, hello):
         self.cfg = cfg = hello["config"]
@@ -62,6 +62,7 @@ class Bot:
         self.path_t = -99.0
         self.cover = None
         self.cover_t = -99.0
+        self.cover_full = False
         self.hist = deque()         # (t, x, y, wanted_move)
         self.stuck_until = 0.0
         self.unstick = (0.0, 0.0)
@@ -77,6 +78,9 @@ class Bot:
         self.peek = None
         self.peek_search_t = -99.0
         self.peek_active = False
+        self.crates = {}            # id -> [x, y, z, hp, t_seen]
+        self.npc_mem = {}           # id -> [x, y, z, t_seen]
+        self.farm = None            # (kind, id) we are working on in ROAM
         self.times = []
         self.n = 0
 
@@ -123,10 +127,25 @@ class Bot:
                     return c * m, sn * m
         return -vx, -vy
 
-    def start_climb(self, t, ux, uy):
+    def start_climb(self, t, ux, uy, dur=2.5):
         self.climb_start = t
-        self.climb_until = t + 2.5
+        self.climb_until = t + dur
         self.climb_dir = (ux, uy)
+
+    def go_to(self, x, y, z, gx, gy, gz, me):
+        """Walk to a goal; if it is on a roof we can reach, jump + jet onto it from close range.
+        Returns (mvx, mvy, climb) where climb asks the caller to jump now."""
+        dz = gz - z
+        hd = math.hypot(gx - x, gy - y)
+        if dz > 3.0 and hd < 16.0:
+            if me["grounded"] and self.t >= self.climb_until:
+                if me["energy"] >= 1.6 * dz + 12:
+                    ux, uy = (gx - x) / (hd or 1), (gy - y) / (hd or 1)
+                    self.start_climb(self.t, ux, uy, 1.2 + dz / 7.0)
+                    return ux, uy, True
+                return 0.0, 0.0, False   # wait for energy at the foot of the building
+            return (gx - x) / (hd or 1), (gy - y) / (hd or 1), False
+        return self.nav_to(x, y, z, gx, gy) + (False,)
 
     def rise_ahead(self, x, y, z, ux, uy):
         g = self.geo
@@ -263,8 +282,9 @@ class Bot:
         off = self.rng.random() * TAU / 16
         found_r = None
         self.heavy = True
+        checks = 0
         for r in (6.0, 12.0, 20.0, 30.0, 42.0, 56.0, 75.0, 100.0):
-            if found_r is not None and r > found_r * 1.6:
+            if (found_r is not None and r > found_r * 1.6) or checks > 44:
                 break
             for k in range(16):
                 a = off + k * (TAU / 16)
@@ -281,6 +301,7 @@ class Bot:
                 if sc >= bs:
                     continue
                 gz = g.ground(px, py)
+                checks += 1
                 if self.hidden_from(px, py, gz, threats):
                     if r > 14 and not g.walk_clear(x, y, z, px, py):
                         sc += r * 0.4               # needs a detour
@@ -288,8 +309,11 @@ class Bot:
                         bs, best = sc, (px, py)
                         if found_r is None:
                             found_r = r
-                elif best is None and sc < ps and self.hidden_torso(px, py, gz, threats):
-                    ps, partial = sc, (px, py)
+                elif best is None and sc < ps:
+                    checks += 1
+                    if self.hidden_torso(px, py, gz, threats):
+                        ps, partial = sc, (px, py)
+        self.cover_full = best is not None
         return best or partial
 
     def find_peek(self, x, y, z, tx, ty, tz, tch, threats, max_range):
@@ -365,7 +389,7 @@ class Bot:
             ready = False
             if laser:
                 lw = laser[1]
-                ready = (lw.get("charge") or 0) >= 0.35 * lw["stats"]["charge"]
+                ready = (lw.get("charge") or 0) > 0
             if not ready and gun:
                 gw = gun[1]
                 gun_ok = gw.get("reload", 0) <= 0 and gw.get("ammo", 0) >= 0.75 * gw["stats"]["mag"]
@@ -486,6 +510,29 @@ class Bot:
             if k not in seen_ids and (dd < 25 or t - it[4] > 90):
                 del self.items[k]
 
+        # ---------------- world: crates and drones (they only show while seen; remember them)
+        seen_cr = set()
+        for c in obs.get("crates", ()):
+            self.crates[c["id"]] = [c["pos"][0], c["pos"][1], c["pos"][2], c["hp"], t]
+            seen_cr.add(c["id"])
+        for cid in list(self.crates):
+            if cid in seen_cr:
+                continue
+            cx_, cy_, cz_, _, ts = self.crates[cid]
+            dd = math.hypot(cx_ - x, cy_ - y)
+            if t - ts > 150 or (dd < 38 and g.los(x, y, eye_z, cx_, cy_, cz_ + 0.8)):
+                del self.crates[cid]   # destroyed (or someone else took it)
+        seen_np = set()
+        for m in obs.get("mechs", ()):
+            if m["kind"] == "npc":
+                self.npc_mem[m["id"]] = [m["pos"][0], m["pos"][1], m["pos"][2], t]
+                seen_np.add(m["id"])
+        for nid in list(self.npc_mem):
+            if nid not in seen_np:
+                nx_, ny_, _, ts = self.npc_mem[nid]
+                if t - ts > 60 or math.hypot(nx_ - x, ny_ - y) < 30:
+                    del self.npc_mem[nid]
+
         # ---------------- enemies
         enemies = []
         npcs = []
@@ -535,28 +582,36 @@ class Bot:
 
         # ---------------- state machine
         frac = hp / mhp
+        # race numbers: time for us to kill the target vs time for incoming fire to kill us
+        ttk = ttd = 1e9
+        finishable = winning = losing = False
+        if target:
+            cubes = me.get("cubes", 0)
+            my_dps = 95.0 * (1 + 0.04 * min(cubes, 10)) + (90.0 if laser else 0.0) + \
+                (110.0 if lightning and target[1] < 45 else 0.0)
+            thp = target[0].get("hp", 1400)
+            ttk = thp / my_dps
+            ttd = hp / dps_in if dps_in > 0 else 1e9
+            finishable = target[2] and target[1] < 170 and ttk <= 2.0 and ttd > 1.1 * ttk
+            # winning the trade: they are clearly lower than us, or we out-race real incoming fire
+            winning = thp / max(target[0].get("max_hp", 1400), 1) < frac - 0.15 or \
+                (dps_in > 0 and ttk < 0.6 * ttd)
+            losing = ttd < 1.25 * ttk
+        self.finishable = finishable
         if self.state == "HEAL":
-            if frac >= 0.9 or (not threats and frac >= 0.75 and t - self.last_combat_t > 10):
+            if frac >= 0.85 or (not threats and frac >= 0.7 and t - self.last_combat_t > 8):
                 self.state = "ROAM"
-            # opportunistic finish: lone, nearly dead target in sight
-            if target and target[2] and target[0].get("hp", 1400) < 0.15 * target[0].get("max_hp", 1400) \
-                    and n_los == 1 and target[1] < 120 and hp > 2.5 * target[0].get("hp", 1400):
-                self.state = "DUEL"
+            if finishable and n_los <= 2:
+                self.state = "DUEL"   # never walk away from a kill we can close in ~2 s
         if self.state != "HEAL":
-            # race check: would we die before we kill the current target?
-            losing = False
-            if target and dps_in > 0:
-                cubes = me.get("cubes", 0)
-                my_dps = 95.0 * (1 + 0.04 * min(cubes, 10)) + (90.0 if laser else 0.0) + (110.0 if lightning and target[1] < 45 else 0.0)
-                ttk = target[0].get("hp", 1400) / my_dps
-                ttd = hp / dps_in
-                losing = ttd < 1.25 * ttk
             n_hit_by = len({d[2] for d in self.dmg_log if t - d[0] < 3.0 and d[2] is not None})
-            heal = (frac < 0.45
-                    or (frac < 0.70 and (n_los >= 2 or n_hit_by >= 2))
-                    or (frac < 0.82 and n_los >= 3)
-                    or (frac < 0.70 and losing)
-                    or (dps_in > 0 and hp / dps_in < 4.0))
+            heal = (frac < 0.42
+                    or (frac < 0.55 and (n_los >= 2 or n_hit_by >= 2))
+                    or (frac < 0.65 and n_los >= 3)
+                    or (frac < 0.50 and losing)
+                    or ttd < 2.5)
+            if finishable and n_los <= 2:
+                heal = False
             if heal and me["in_zone"]:
                 self.state = "HEAL"
                 self.cover = None
@@ -586,7 +641,7 @@ class Bot:
             want_boost = True
             label = "ZONE"
         elif self.state == "HEAL":
-            if threats and (self.cover is None or t - self.cover_t > 0.35):
+            if threats and (self.cover is None or t - self.cover_t > (0.35 if self.cover_full else 1.0)):
                 if self.cover is None or not self.hidden_from(self.cover[0], self.cover[1],
                                                                g.ground(*self.cover), threats):
                     self.cover = self.find_cover(x, y, z, threats)
@@ -622,9 +677,13 @@ class Bot:
                 R = 32.0
             if laser and not lightning:
                 R = 130.0
+            if finishable:
+                R = min(R, 70.0)   # close in and keep firing
+                label = "FINISH"
             reloading = gun and gun[1].get("reload", 0) > 0
             pv = None
-            if d > 50 and frac > 0.35 and n_los <= 2 and (laser or gun) and not lightning_close(lightning, d):
+            if d > 50 and frac > 0.35 and n_los <= 2 and (laser or gun) and not lightning_close(lightning, d) \
+                    and not finishable and not winning:
                 pv = self.peek_move(x, y, z, me, target, threats, laser, gun)
             if pv is not None:
                 self.peek_active = True
@@ -664,45 +723,75 @@ class Bot:
                     if nd > 0.55 * self.zone["next_radius"] + 5:
                         mvx, mvy = self.nav_to(x, y, z, ax_, ay_)
         else:
-            # ROAM: loot, cubes, supply drop, farm, else hold near the zone anchor
-            goal = None
+            # ROAM: route to the best-value loot (weapons, cubes, crates, drones, drops), else hold the zone anchor
             slot1_kind = w1["kind"] if w1 else None
-            best_v = 0.0
-            danger = bool(enemies) or t - self.last_combat_t < 4
+            pressured = any(e[2] and e[1] < 160 or e[1] < 90 for e in enemies) or t - self.last_combat_t < 4
+            calm = not pressured and frac > 0.5
+            best_v, goal = 0.0, None   # goal = (x, y, z, kind, id)
             for k, it in self.items.items():
                 kind, ix, iy, iz = it[0], it[1], it[2], it[3]
                 dd = math.hypot(ix - x, iy - y)
-                if not self.zone_ok(ix, iy, 15.0, dd / 11.0 + 5):
+                if dd > 230 or not self.zone_ok(ix, iy, 15.0, dd / 11.0 + 5):
+                    continue
+                if iz - z > 45:      # beyond one jet climb
                     continue
                 if kind == "cube":
-                    v = 2.0 if dd < 80 else 0.0
+                    v = 4.0
                 else:
                     if kind in slots or WEAPON_PREF.get(kind, 0) <= WEAPON_PREF.get(slot1_kind, -1):
                         continue
-                    if abs(iz - z) > (40 if kind == "laser" else 20) and dd > 30:  # high rooftops: skip
-                        continue
-                    lim = 230 if kind == "laser" else 160
-                    v = 3.0 + WEAPON_PREF[kind] * (1.6 if kind == "laser" else 1.0) if dd < lim else 0.0
-                if v <= 0:
-                    continue
-                v = v / (1.0 + dd / 40.0)
+                    v = 6.0 + (4.0 if kind == "laser" else 0.0)
+                v /= (1.0 + dd / 45.0)
                 if v > best_v:
-                    best_v, goal = v, (ix, iy)
-            if goal is None and not danger:
+                    best_v, goal = v, (ix, iy, iz, kind, k)
+            if calm:
+                for cid, (cx_, cy_, cz_, chp, _) in self.crates.items():
+                    dd = math.hypot(cx_ - x, cy_ - y)
+                    if dd > 200 or cz_ - z > 45 or not self.zone_ok(cx_, cy_, 15.0, dd / 11.0 + 5):
+                        continue
+                    roof = cz_ > g.ground(cx_, cy_) + 3.0
+                    v = (2.4 if roof else 3.0) * (1.2 if chp < 150 else 1.0) / (1.0 + dd / 45.0)
+                    if v > best_v:
+                        best_v, goal = v, (cx_, cy_, cz_, "crate", cid)
+                if frac > 0.7:
+                    for nid, (nx_, ny_, nz_, _) in self.npc_mem.items():
+                        dd = math.hypot(nx_ - x, ny_ - y)
+                        if dd > 180 or not self.zone_ok(nx_, ny_, 15.0, dd / 11.0 + 5):
+                            continue
+                        v = 3.2 / (1.0 + dd / 45.0)
+                        if v > best_v:
+                            best_v, goal = v, (nx_, ny_, nz_, "npc", nid)
                 for dr in obs.get("drops", ()):
-                    dx_, dy_, _ = dr["pos"]
+                    dx_, dy_, dz_ = dr["pos"]
                     dd = math.hypot(dx_ - x, dy_ - y)
                     if dd < 170 and dr["lands_in"] < dd / 11.0 + 6 and self.zone_ok(dx_, dy_, 5.0, 10.0):
-                        goal = (dx_, dy_)
-                        label = "DROP"
-                        break
-            if goal is None:
-                goal = (ax_, ay_)
-                if nd < 0.55 * self.zone["next_radius"] + 2:
-                    goal = None  # already in a good spot: stand still (silent)
-            if goal:
-                mvx, mvy = self.nav_to(x, y, z, goal[0], goal[1])
-                want_boost = math.hypot(goal[0] - x, goal[1] - y) > 90 and me["energy"] > 60
+                        v = 8.0 / (1.0 + dd / 45.0)
+                        if v > best_v:
+                            best_v, goal = v, (dx_, dy_, dz_, "drop", dr["id"])
+            self.farm = None
+            if goal is not None:
+                gx, gy, gz, kind, gid = goal
+                label = "LOOT-" + kind
+                dd = math.hypot(gx - x, gy - y)
+                if kind in ("crate", "npc"):
+                    aim_h = gz + (0.8 if kind == "crate" else 1.75)
+                    if dd < (90 if kind == "crate" else 85) and g.los(x, y, muz_z, gx, gy, aim_h):
+                        self.farm = (kind, gid, gx, gy, gz, aim_h)   # shoot it from here
+                        if kind == "npc" and dd < 50:   # keep outside its aggro/leash ring
+                            mvx, mvy = (x - gx) / (dd or 1), (y - gy) / (dd or 1)
+                    else:
+                        mvx, mvy, jump_now = self.go_to(x, y, z, gx, gy, gz, me)
+                        jump = jump or jump_now
+                else:
+                    mvx, mvy, jump_now = self.go_to(x, y, z, gx, gy, gz, me)
+                    jump = jump or jump_now
+                want_boost = want_boost or (dd > 70 and me["energy"] > 70)
+            else:
+                ax2, ay2 = ax_, ay_
+                if nd >= 0.55 * self.zone["next_radius"] + 2:
+                    mvx, mvy = self.nav_to(x, y, z, ax2, ay2)
+                    want_boost = nd > 90 and me["energy"] > 60
+                # else: already in a good spot: stand still (silent)
 
         # ---------------- zone bias & dodge
         if not zone_urgent:
@@ -779,6 +868,15 @@ class Bot:
         engage = None
         if target and self.state != "ROAM":
             engage = (target[0], target[1], target[2], target[3])
+        elif self.state == "ROAM" and self.farm is not None and not zone_urgent:
+            kind, fid, fx, fy, fz, fh = self.farm
+            fd = math.hypot(fx - x, fy - y)
+            if kind == "npc":
+                nm = next((n[0] for n in npcs if n[0]["id"] == fid), None)
+                if nm is not None:
+                    engage = (nm, fd, True, fh)
+            else:
+                engage = ({"id": fid, "pos": [fx, fy, fz], "vel": [0, 0, 0]}, fd, True, fh)
         elif self.state == "ROAM" and not enemies and frac > 0.55 and not zone_urgent:
             # farm drones and crates for cubes
             cand = [(n[1], n[0], n[2]) for n in npcs if n[1] < 110]
