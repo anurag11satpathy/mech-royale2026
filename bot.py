@@ -22,6 +22,11 @@ WEAPON_PREF = {"laser": 3.0, "lightning": 2.5, "mortar": 1.0, "gun": 0.0}
 GHOST_DIST = {"gun": 120, "laser": 150, "mortar": 160, "lightning": 35, "npc": 40}
 
 
+def lightning_close(lightning, d):
+    """With lightning in hand and the target nearly in arc range, brawl instead of peeking."""
+    return lightning is not None and d < lightning[1]["stats"]["range"] * 1.3
+
+
 def wrap(a):
     return (a + PI) % TAU - PI
 
@@ -31,7 +36,7 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v1"
+    name = "anurag-v2"
 
     def __init__(self, hello):
         self.cfg = cfg = hello["config"]
@@ -68,6 +73,10 @@ class Bot:
         self.look_until = 0.0
         self.last_los_t = -99.0
         self.laser_hold_t = None
+        self.laser_fired_t = -99.0
+        self.peek = None
+        self.peek_search_t = -99.0
+        self.peek_active = False
         self.times = []
         self.n = 0
 
@@ -157,7 +166,7 @@ class Bot:
             self.planner = AStar(g, (x, y), (gx, gy))
             self.planner_goal = (gx, gy)
         if self.planner is not None:
-            if self.planner.step(450):
+            if self.planner.step(0 if self.heavy else 450):
                 if self.planner.path:
                     self.path = self.planner.path
                     self.path_i = 0
@@ -231,31 +240,154 @@ class Bot:
                 return False
         return True
 
+    def hidden_torso(self, px, py, pz, threats):
+        los = self.geo.los
+        for tx, ty, tz in threats:
+            if los(tx, ty, tz + 8.0, px, py, pz + 5.0):
+                return False
+        return True
+
     def find_cover(self, x, y, z, threats):
+        """Nearest spot (behind a building or terrain ridge) that breaks line of sight to every threat.
+        Spots hugging walls are allowed (that is where cover is); routes that run toward threats cost more."""
         g = self.geo
+        threats = sorted(threats, key=lambda q: (q[0] - x) ** 2 + (q[1] - y) ** 2)[:4]
+        if not threats:
+            return None
+        cx = sum(q[0] for q in threats) / len(threats) - x
+        cy = sum(q[1] for q in threats) / len(threats) - y
+        cd = math.hypot(cx, cy) or 1.0
+        cx, cy = cx / cd, cy / cd
         best, bs = None, 1e18
-        off = self.rng.random() * TAU
-        for r in (9.0, 18.0, 30.0, 45.0):
-            for k in range(12):
-                a = off + k * (TAU / 12)
-                px, py = x + math.cos(a) * r, y + math.sin(a) * r
-                c = g.ncell(px, py)
-                if g.NAV[c] != 1:   # free and not hugging a wall corner
+        partial, ps = None, 1e18
+        off = self.rng.random() * TAU / 16
+        found_r = None
+        self.heavy = True
+        for r in (6.0, 12.0, 20.0, 30.0, 42.0, 56.0, 75.0, 100.0):
+            if found_r is not None and r > found_r * 1.6:
+                break
+            for k in range(16):
+                a = off + k * (TAU / 16)
+                ux, uy = math.cos(a), math.sin(a)
+                toward = ux * cx + uy * cy          # >0: running at the threats
+                if r > 56.0 and toward > 0.3:
+                    continue                        # long runs only away from the threats
+                px, py = x + ux * r, y + uy * r
+                if not g.NAV[g.ncell(px, py)]:
                     continue
                 if not self.zone_ok(px, py, 10.0, 10.0):
                     continue
-                gz = g.ground(px, py)
-                if not self.hidden_from(px, py, gz, threats):
+                sc = r * (1.0 + 1.5 * max(0.0, toward))
+                if sc >= bs:
                     continue
-                sc = r
-                for tx, ty, _ in threats:
-                    td = math.hypot(px - tx, py - ty)
-                    sc -= min(td, 200.0) * 0.25
-                if sc < bs:
-                    bs, best = sc, (px, py)
-            if best is not None and r >= 18.0:
-                break
+                gz = g.ground(px, py)
+                if self.hidden_from(px, py, gz, threats):
+                    if r > 14 and not g.walk_clear(x, y, z, px, py):
+                        sc += r * 0.4               # needs a detour
+                    if sc < bs:
+                        bs, best = sc, (px, py)
+                        if found_r is None:
+                            found_r = r
+                elif best is None and sc < ps and self.hidden_torso(px, py, gz, threats):
+                    ps, partial = sc, (px, py)
+        return best or partial
+
+    def find_peek(self, x, y, z, tx, ty, tz, tch, threats, max_range):
+        """Pair a cover spot C (hidden from all threats) with a firing spot P (sees the target) a few meters away."""
+        g = self.geo
+        if z > g.ground(x, y) + 3.0:
+            return None  # roofs: no peek logic in v2
+        los = g.los
+        self.heavy = True
+        teye = tz + 8.0
+        others = [q for q in threats if abs(q[0] - tx) > 1 or abs(q[1] - ty) > 1]
+        base = math.atan2(ty - y, tx - x)
+        pts = [(x, y)]
+        for r, n in ((5.0, 8), (10.0, 10), (16.0, 10), (23.0, 12)):
+            for k in range(n):
+                a = base + (k + (0.5 if r in (10.0, 23.0) else 0.0)) * TAU / n
+                pts.append((x + math.cos(a) * r, y + math.sin(a) * r))
+        hid, vis = [], []
+        for px, py in pts:
+            if not g.NAV[g.ncell(px, py)] or not self.zone_ok(px, py, 10.0, 8.0):
+                continue
+            dt = math.hypot(px - tx, py - ty)
+            if dt < 45.0:
+                continue
+            gz = g.ground(px, py)
+            if los(tx, ty, teye, px, py, gz + 8.8):
+                if dt < max_range and los(px, py, gz + 7.0, tx, ty, tch):
+                    vis.append((px, py))
+            elif self.hidden_from(px, py, gz, others[:3]):
+                hid.append((px, py))
+        best, bs = None, 1e18
+        for cxp, cyp in hid:
+            dc = math.hypot(cxp - x, cyp - y)
+            for pxp, pyp in vis:
+                dcp = math.hypot(cxp - pxp, cyp - pyp)
+                if dcp < 2.0 or dcp > 10.5:
+                    continue
+                s = dc + 0.7 * dcp
+                if s < bs and g.walk_clear(cxp, cyp, g.ground(cxp, cyp), pxp, pyp):
+                    bs, best = s, ((cxp, cyp), (pxp, pyp))
         return best
+
+    def peek_move(self, x, y, z, me, target, threats, laser, gun):
+        """Peek cycle: wait (and charge the laser) at C, step out to P to shoot, step back to C."""
+        t = self.t
+        m, d, vis, ch = target
+        tx, ty, tz = m["pos"]
+        pk = self.peek
+        need = (pk is None or pk["tid"] != m["id"] or math.hypot(tx - pk["tx"], ty - pk["ty"]) > 15
+                or t - pk["t"] > 5.0)
+        if not need and pk["phase"] == "cover" and t - pk.get("chk", 0) > 0.3:
+            pk["chk"] = t
+            cxp, cyp = pk["C"]
+            if not self.hidden_from(cxp, cyp, self.geo.ground(cxp, cyp), threats[:4]):
+                need = True
+        if need:
+            if t - self.peek_search_t < 0.8:
+                return None if pk is None or pk["tid"] != m["id"] else self._peek_vec(x, y, z, pk)
+            self.peek_search_t = t
+            rng_max = (laser[1]["stats"]["range"] if laser else gun[1]["stats"]["range"] if gun else 200) * 0.85
+            pair = self.find_peek(x, y, z, tx, ty, tz, ch, threats[:4], rng_max)
+            if not pair:
+                self.peek = None
+                return None
+            keep = pk is not None and pk["tid"] == m["id"]
+            self.peek = pk = {"C": pair[0], "P": pair[1], "tid": m["id"], "tx": tx, "ty": ty, "t": t,
+                              "phase": pk["phase"] if keep else "cover", "pt": pk["pt"] if keep else t,
+                              "hp0": pk["hp0"] if keep else me["hp"], "chk": t}
+        # phase transitions
+        hp = me["hp"]
+        if pk["phase"] == "cover":
+            at_c = math.hypot(pk["C"][0] - x, pk["C"][1] - y) < 3.0
+            ready = False
+            if laser:
+                lw = laser[1]
+                ready = (lw.get("charge") or 0) >= 0.35 * lw["stats"]["charge"]
+            if not ready and gun:
+                gw = gun[1]
+                gun_ok = gw.get("reload", 0) <= 0 and gw.get("ammo", 0) >= 0.75 * gw["stats"]["mag"]
+                ready = gun_ok and (not laser or laser[1].get("cooldown", 0) > 0.9)
+            if at_c and ready:
+                pk["phase"], pk["pt"], pk["hp0"] = "out", t, hp
+                self.laser_fired_t = -99.0
+        else:
+            took = pk["hp0"] - hp
+            fired = self.laser_fired_t > pk["pt"] and t - self.laser_fired_t > 0.45
+            gun_dry = gun is None or gun[1].get("ammo", 0) <= 1 or gun[1].get("reload", 0) > 0
+            charging = laser is not None and (laser[1].get("charge") or 0) > 0
+            if t - pk["pt"] > 3.0 or took > 230 or (fired and (gun_dry or t - self.laser_fired_t > 1.2)) or \
+                    (not laser and gun_dry) or (laser and not charging and not fired and gun_dry):
+                pk["phase"], pk["pt"] = "cover", t
+        return self._peek_vec(x, y, z, pk)
+
+    def _peek_vec(self, x, y, z, pk):
+        gx, gy = pk["C"] if pk["phase"] == "cover" else pk["P"]
+        if math.hypot(gx - x, gy - y) < 0.7:
+            return 0.0, 0.0
+        return self.nav_to(x, y, z, gx, gy)
 
     # ------------------------------------------------------------------ aiming
     def lead(self, mx, my, mz, tx, ty, tz, tvx, tvy, tvz, speed):
@@ -297,6 +429,7 @@ class Bot:
 
     def _act(self, obs):
         self.obs = obs
+        self.heavy = False   # set when a cover/peek search ran this tick; A* then waits a tick
         t = self.t = obs["t"]
         self.zone = obs["zone"]
         me = obs["self"]
@@ -371,6 +504,7 @@ class Bot:
             self.last_los_t = t
         threats = [(e[0]["pos"][0], e[0]["pos"][1], e[0]["pos"][2]) for e in enemies if e[1] < 260]
         threats += [(gx, gy, g.ground(gx, gy)) for (_, gx, gy) in self.ghosts]
+        threats.sort(key=lambda q: (q[0] - x) ** 2 + (q[1] - y) ** 2)
 
         # ---------------- weapons
         w0 = me["weapons"][0]
@@ -409,8 +543,20 @@ class Bot:
                     and n_los == 1 and target[1] < 120 and hp > 2.5 * target[0].get("hp", 1400):
                 self.state = "DUEL"
         if self.state != "HEAL":
-            heal = (frac < 0.40 or (frac < 0.62 and n_los >= 2) or (frac < 0.75 and n_los >= 3)
-                    or (frac < 0.55 and dps_in > 160))
+            # race check: would we die before we kill the current target?
+            losing = False
+            if target and dps_in > 0:
+                cubes = me.get("cubes", 0)
+                my_dps = 95.0 * (1 + 0.04 * min(cubes, 10)) + (90.0 if laser else 0.0) + (110.0 if lightning and target[1] < 45 else 0.0)
+                ttk = target[0].get("hp", 1400) / my_dps
+                ttd = hp / dps_in
+                losing = ttd < 1.25 * ttk
+            n_hit_by = len({d[2] for d in self.dmg_log if t - d[0] < 3.0 and d[2] is not None})
+            heal = (frac < 0.45
+                    or (frac < 0.70 and (n_los >= 2 or n_hit_by >= 2))
+                    or (frac < 0.82 and n_los >= 3)
+                    or (frac < 0.70 and losing)
+                    or (dps_in > 0 and hp / dps_in < 4.0))
             if heal and me["in_zone"]:
                 self.state = "HEAL"
                 self.cover = None
@@ -420,6 +566,9 @@ class Bot:
                 self.state = "ROAM"
 
         # ---------------- movement intent
+        self.peek_active = False
+        if self.state != "DUEL":
+            self.peek = None
         mvx = mvy = 0.0
         want_boost = False
         jump = False
@@ -437,16 +586,21 @@ class Bot:
             want_boost = True
             label = "ZONE"
         elif self.state == "HEAL":
-            if threats and (self.cover is None or t - self.cover_t > 0.6):
+            if threats and (self.cover is None or t - self.cover_t > 0.35):
                 if self.cover is None or not self.hidden_from(self.cover[0], self.cover[1],
                                                                g.ground(*self.cover), threats):
                     self.cover = self.find_cover(x, y, z, threats)
                 self.cover_t = t
             if self.cover:
                 cdist = math.hypot(self.cover[0] - x, self.cover[1] - y)
-                if cdist > 2.0:
+                me_hidden = bool(threats) and self.hidden_from(x, y, z, threats[:4])
+                if me_hidden and cdist < 6.0:
+                    label = "HEAL-hidden"          # stand still: silent, regenerating
+                elif cdist > 0.6:
                     mvx, mvy = self.nav_to(x, y, z, self.cover[0], self.cover[1])
                     want_boost = cdist > 8
+                else:
+                    self.cover = None              # on the spot but still seen: search again
             elif threats:
                 # no cover: run away from the threat centroid, toward the zone
                 cx = sum(tq[0] for tq in threats) / len(threats)
@@ -469,7 +623,16 @@ class Bot:
             if laser and not lightning:
                 R = 130.0
             reloading = gun and gun[1].get("reload", 0) > 0
-            if vis or d < 60:
+            pv = None
+            if d > 50 and frac > 0.35 and n_los <= 2 and (laser or gun) and not lightning_close(lightning, d):
+                pv = self.peek_move(x, y, z, me, target, threats, laser, gun)
+            if pv is not None:
+                self.peek_active = True
+                mvx, mvy = pv
+                label = "PEEK-" + self.peek["phase"]
+                want_boost = self.peek["phase"] == "cover" and math.hypot(
+                    self.peek["C"][0] - x, self.peek["C"][1] - y) > 10
+            elif vis or d < 60:
                 if t > self.strafe_until:
                     self.strafe_sign = self.rng.choice((-1, 1))
                     self.strafe_until = t + self.rng.uniform(0.7, 2.0)
@@ -478,10 +641,10 @@ class Bot:
                 strafe = 0.85
                 if m.get("charging"):
                     strafe = 1.0  # their laser is up: juke hard
-                if reloading and not (laser or lightning or mortar):
-                    # peek cycle: duck out of sight while reloading
+                if reloading and not (laser or lightning or mortar) and d > 45:
+                    # no peek pair: still duck out of sight while reloading
                     if self.cover is None or t - self.cover_t > 1.0:
-                        self.cover = self.find_cover(x, y, z, threats[:3])
+                        self.cover = self.find_cover(x, y, z, threats)
                         self.cover_t = t
                     if self.cover:
                         mvx, mvy = self.nav_to(x, y, z, self.cover[0], self.cover[1])
@@ -516,9 +679,10 @@ class Bot:
                 else:
                     if kind in slots or WEAPON_PREF.get(kind, 0) <= WEAPON_PREF.get(slot1_kind, -1):
                         continue
-                    if abs(iz - z) > 20 and dd > 30:  # rooftop loot: skip in v1
+                    if abs(iz - z) > (40 if kind == "laser" else 20) and dd > 30:  # high rooftops: skip
                         continue
-                    v = 3.0 + WEAPON_PREF[kind] if dd < 160 else 0.0
+                    lim = 230 if kind == "laser" else 160
+                    v = 3.0 + WEAPON_PREF[kind] * (1.6 if kind == "laser" else 1.0) if dd < lim else 0.0
                 if v <= 0:
                     continue
                 v = v / (1.0 + dd / 40.0)
@@ -654,15 +818,21 @@ class Bot:
                     on_l = abs(wrap(ay - direct_yaw)) * max(d, 1) < rad * 0.7 and \
                         abs(ap - direct_pitch) * max(d, 1) < 3.0
                     hold = charge < full * 0.98 or not (on_l and los_shot)
-                    if self.laser_hold_t is not None and t - self.laser_hold_t > full + 1.6:
-                        hold = False  # don't let it auto-fire wildly
+                    if self.laser_hold_t is not None and t - self.laser_hold_t > full + 1.7:
+                        hold = False  # release before the forced auto-fire
+                        if not los_shot:
+                            self.peek = None  # that firing spot didn't see the target: pick another
+                            self.peek_active = False
                     if li == 1:
                         fire1 = hold
                     else:
                         fire0 = hold
                     if not hold:
                         self.laser_hold_t = None
-                elif lw.get("cooldown", 0) <= 0 and los_shot and d < lw["stats"]["range"] * 0.95:
+                        self.laser_fired_t = t
+                elif lw.get("cooldown", 0) <= 0 and d < lw["stats"]["range"] * 0.95 and (
+                        los_shot or (self.peek_active and self.peek["phase"] == "cover"
+                                     and math.hypot(self.peek["C"][0] - x, self.peek["C"][1] - y) < 4.0)):
                     self.laser_hold_t = t
                     if li == 1:
                         fire1 = True
@@ -717,6 +887,9 @@ class Bot:
 
         if gun:
             gw = gun[1]
+            if self.peek_active and self.peek["phase"] == "cover" and gw.get("reload", 0) <= 0 and \
+                    gw.get("ammo", 12) < gw["stats"]["mag"] and not fire0 and not fire1:
+                reload_ = True
             if gw.get("reload", 0) <= 0:
                 if gw.get("ammo", 1) == 0:
                     reload_ = True
