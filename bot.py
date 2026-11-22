@@ -51,10 +51,10 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v7"
+    name = "anurag-v7e"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
-    R_LASER = 130.0      # preferred duel range with a laser
+    R_LASER = 170.0      # preferred duel range with a laser (probe E; v7 130)
     HEAL_EXIT = 0.85     # leave HEAL at this HP fraction
     PREHEAL = 0.0        # with no enemy in sight, go heal (cover + stand still) below this HP fraction
     HEAL_BASE = 0.42     # HEAL below this HP fraction
