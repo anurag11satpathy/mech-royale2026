@@ -18,3 +18,4 @@ v8,1afab0f,"STACK: v7 + D (stall 7 cubes/110 s) + E (laser range 170 m) + F (sta
 pacifist,1139e47,"PURE PACIFIST storm-win test (storm.py entrypoint): 0 kills, farm/hide/roofs/drops, final-circle centre. Sim: 0/16 storm wins under all modelled hunter behaviours; live test of whether real house bots lose a hidden silent mech",0.06
 v9-lct,ae9224a,"Laser-cycle timing (duck before ready enemy laser fires): sim laser dmg taken -20% but score 5.22 vs v7 5.32 -> not submitted. Also sim-tested and rejected: aim fix (+7% DPS, score =v7), burst upgrade order (5.21)",
 v10-anchor,e88b83d,"Cover-pocket anchors + ambush + resets (+/- v9 laser timing): 6-seed sim tie with v7 (best variant 5.29 vs 5.33); anchored only 12% of time -> not submitted",
+v10+numpy,d8840f1,"numpy tactical grid + danger A* + laser timing (branch v10-anchor): 7-seed sim 5.41 vs v7 5.32 (+0.09) -> below +0.3 bar, not submitted",
