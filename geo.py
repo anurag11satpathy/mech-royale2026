@@ -1,11 +1,6 @@
 """Map geometry: line of sight, walkability probes, and budgeted A* on the precomputed grid (data/map.bin)."""
 import array, heapq, json, math, struct, sys, zlib
 
-try:                      # optional: vectorised LOS for the tactical grid / danger maps
-    import numpy as np
-except ImportError:       # pragma: no cover
-    np = None
-
 INF = float("inf")
 
 
@@ -34,31 +29,6 @@ class Geo:
         self.NAV = body[6 * n:6 * n + self.nnx * self.nny]
         self.inv = 1.0 / self.cs
         self.ninv = 1.0 / self.ncs
-        if np is not None:
-            self.Gn = np.array(self.G, dtype=np.float32).reshape(self.ny, self.nx)
-            self.Bn = np.array(self.B, dtype=np.float32).reshape(self.ny, self.nx)
-            self.Tn = np.array(self.T, dtype=np.float32).reshape(self.ny, self.nx)
-            self.NAVn = np.frombuffer(bytes(self.NAV), dtype=np.uint8).reshape(self.nny, self.nnx)
-
-    def los_many(self, A, Bp, step=2.0, kmax=160):
-        """Vectorised LOS for N segments A[i] -> Bp[i] (arrays (N, 3)). Same rule as los(): blocked by terrain or
-        a solid's [base, top] band; endpoints excluded."""
-        A = np.asarray(A, dtype=np.float32); Bp = np.asarray(Bp, dtype=np.float32)
-        if len(A) == 0:
-            return np.zeros(0, dtype=bool)
-        d = Bp - A
-        L = np.sqrt(d[:, 0] ** 2 + d[:, 1] ** 2)
-        K = int(min(kmax, max(2, float(L.max()) / step + 1)))
-        f = (np.arange(1, K, dtype=np.float32) / K)[None, :, None]          # (1, K-1, 1)
-        P = A[:, None, :] + d[:, None, :] * f                                # (N, K-1, 3)
-        i = ((P[..., 0] - self.x0) * self.inv).astype(np.int32)
-        j = ((P[..., 1] - self.y0) * self.inv).astype(np.int32)
-        inb = (i >= 0) & (j >= 0) & (i < self.nx) & (j < self.ny)
-        i = np.clip(i, 0, self.nx - 1); j = np.clip(j, 0, self.ny - 1)
-        z = P[..., 2]
-        blocked = ((z < self.Gn[j, i]) | ((self.Bn[j, i] <= z) & (z <= self.Tn[j, i]))) & inb
-        return ~blocked.any(axis=1)
-
 
     # ---------- fine grid ----------
     def cell(self, x, y):
@@ -155,8 +125,7 @@ class AStar:
     NB = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
           (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)]
 
-    def __init__(self, geo, start_xy, goal_xy, w=2.0, cap=20000, penalty=None):
-        self.penalty = penalty or {}
+    def __init__(self, geo, start_xy, goal_xy, w=2.0, cap=20000):
         self.geo = geo
         s = geo.nearest_free(geo.ncell(*start_xy))
         g = geo.nearest_free(geo.ncell(*goal_xy))
@@ -212,7 +181,7 @@ class AStar:
                     continue
                 if di and dj and not (NAV[j * nnx + a] and NAV[b * nnx + i]):
                     continue  # no corner cutting
-                ng = gc + d * k * self.penalty.get(n, 1.0)
+                ng = gc + d * k
                 if ng < cost.get(n, INF):
                     cost[n] = ng
                     parent[n] = c
