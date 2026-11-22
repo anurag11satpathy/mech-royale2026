@@ -5,6 +5,10 @@ All logging goes to stderr (mf.log). Reads only data/map.bin (shipped) and write
 import gc, math, os, random, time
 from collections import deque
 
+# 1-CPU container: never let BLAS/OpenMP spawn competing threads (set before numpy is imported via geo)
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import mechfight as mf
 from geo import Geo, AStar, np
 
