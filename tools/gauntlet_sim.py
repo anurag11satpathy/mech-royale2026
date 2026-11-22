@@ -23,7 +23,7 @@ import argparse, gzip, importlib.util, json, math, os, random, sys, time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from geo import AStar  # noqa: E402
+from geo import AStar, Geo  # noqa: E402
 from combat_sim import Body, ring_spot  # noqa: E402
 
 lines = gzip.open(os.path.join(ROOT, "check/stream.jsonl.gz"), "rt").read().splitlines()
@@ -48,8 +48,12 @@ TIERS = [("easy", 3.0, 0.7, False, 0.0, 1400.0)] * 4 + [("medium", 1.6, 0.45, Tr
 DIFF = {"spread": 1.0, "react": 1.0, "lhit": 0.0, "hp": 1.0, "loot": 1.0}
 
 
+LATE = {"t": 240.0}   # when "all of them late" kicks in (unknown live; --late)
+MODE = {"hunters": True, "tracking": "omni"}   # --no-hunters; --tracking seen = squad only knows our position while one sees us
+
+
 def WANT(t, kills, left):
-    return left if t > 240 else (1 if kills < 4 else 2 if kills < 8 else 3)
+    return left if t > LATE["t"] else (1 if kills < 4 else 2 if kills < 8 else 3)
 
 
 def wrap(a):
@@ -173,8 +177,9 @@ def mortar_vel(sx, sy, sz, tx, ty, tz, high):
     return [v * math.cos(th) * math.cos(yaw), v * math.cos(th) * math.sin(yaw), v * math.sin(th)]
 
 
-def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
-    b = mod.Bot(HELLO)
+def run_trial(mod, g, rng, max_t=480.0, zone_on=True, secondaries=SECONDARIES, cls="Bot"):
+    b = getattr(mod, cls)(HELLO)
+    hp380 = None
     zphases = make_zone(rng)
     while True:
         x, y = rng.uniform(-250, 300), rng.uniform(-150, 200)
@@ -210,7 +215,8 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
         pickups.append({"id": ids["pk"], "kind": kind, "pos": list(pos)})
         ids["pk"] += 1
 
-    queue = list(TIERS)
+    queue = list(TIERS) if MODE["hunters"] else []
+    squad_seen_t, squad_last = -99.0, None
     foes, spawned = [], 0
 
     def spawn(tier):
@@ -310,14 +316,18 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
         alive = [f for f in foes if f.hp > 0]
         if kills >= 4 and cubes_at_4th is None:
             cubes_at_4th = me.cubes
-        if not alive and not queue:
+        if not alive and not queue and MODE["hunters"]:
             return dict(res="win", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got,
-                        score=sum(1 for f in foes if f.hp <= 0))
+                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got, hp380=hp380, maxhp=me.max_hp,
+                        roof=getattr(b, "stats_roof_ticks", 0), loud=getattr(b, "stats_loud_ticks", 0),
+                        score=sum(1 for f in foes if f.hp <= 0) + (0 if me.hp > 0 or True else 0))
+        if hp380 is None and t >= 380.0:
+            hp380 = me.hp
         if me.hp <= 0:
             return dict(res="dead", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got,
-                        score=sum(1 for f in foes if f.hp <= 0))
+                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got, hp380=hp380, maxhp=me.max_hp,
+                        roof=getattr(b, "stats_roof_ticks", 0), loud=getattr(b, "stats_loud_ticks", 0),
+                        score=sum(1 for f in foes if f.hp <= 0) + (0 if me.hp > 0 or True else 0))
         mx, my, mz = me.pos
 
         def seen_by_me(px, py, pz, h):
@@ -544,6 +554,16 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
                 n["cd"] = 1.0
         # ---- hunters
         lagged = vel_hist[-3] if len(vel_hist) >= 3 else (0.0, 0.0)
+        if any(math.hypot(mx - f.body.x, my - f.body.y) < 200 and
+               (g.los(f.body.x, f.body.y, f.body.z + 8, mx, my, mz + 4.5) or g.los(f.body.x, f.body.y, f.body.z + 8, mx, my, mz + 9))
+               for f in alive) or t < 1.0:
+            squad_seen_t, squad_last = t, (mx, my)
+        # sounds give us away too: moving > 5 m/s within 40 m (steps) / 90 m (boost), any gunfire within 320 m
+        spd_me = math.hypot(*me.vel)
+        for f in alive:
+            dd_ = math.hypot(mx - f.body.x, my - f.body.y)
+            if (spd_me > 5.0 and dd_ < (90 if a.get("boost") else 40)) or (a["fire"][0] and dd_ < 320):
+                squad_seen_t, squad_last = t, (mx, my)
         for f in alive:
             fx, fy, fz = f.pos
             d = math.hypot(mx - fx, my - fy)
@@ -566,8 +586,13 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
                 dd = d or 1
                 mvx, mvy = (mx - fx) / dd, (my - fy) / dd          # rush straight in
             else:
+                tgt_x, tgt_y = (mx, my) if MODE["tracking"] == "omni" else (squad_last if squad_last else (fx, fy))
+                if MODE["tracking"] != "omni" and squad_last and math.hypot(fx - tgt_x, fy - tgt_y) < 12:
+                    # reached the last known spot and we're not there: search around it
+                    a_ = rng.uniform(0, 2 * math.pi)
+                    squad_last = (tgt_x + math.cos(a_) * 60, tgt_y + math.sin(a_) * 60)
                 if f.path is None or t - f.path_t > 3.0:
-                    s_ = AStar(g, (fx, fy), (mx, my))
+                    s_ = AStar(g, (fx, fy), (tgt_x, tgt_y))
                     while not s_.step(5000):
                         pass
                     f.path, f.path_t, f.pi = s_.path, t, 0
@@ -577,6 +602,11 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
                     wx, wy = f.path[f.pi]
                     dd = math.hypot(wx - fx, wy - fy) or 1
                     mvx, mvy = (wx - fx) / dd, (wy - fy) / dd
+            if zone_on:
+                _, zcx_, zcy_, zr_ = zone_now(zphases, t)
+                dz_ = math.hypot(fx - zcx_, fy - zcy_)
+                if dz_ > zr_ - 8.0:                 # house bots keep inside the circle
+                    mvx, mvy = (zcx_ - fx) / (dz_ or 1), (zcy_ - fy) / (dz_ or 1)
             fox, foy = f.body.x, f.body.y
             climb = (mz > fz + 3.0 and d < 30.0) or (math.hypot(*f.vel) < 1.0 and (mvx or mvy))
             if climb:
@@ -736,8 +766,9 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
             if f.hp > 0 and t - f.last_combat > 5.0:
                 f.hp = min(f.max_hp, f.hp + 4.5)
     return dict(res="timeout", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got,
-                        score=sum(1 for f in foes if f.hp <= 0))
+                laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got, hp380=hp380, maxhp=me.max_hp,
+                        roof=getattr(b, "stats_roof_ticks", 0), loud=getattr(b, "stats_loud_ticks", 0),
+                        score=sum(1 for f in foes if f.hp <= 0) + (0 if me.hp > 0 or True else 0))
 
 
 def main():
@@ -747,6 +778,10 @@ def main():
     ap.add_argument("--seed", type=int, default=31)
     ap.add_argument("--name", default="")
     ap.add_argument("--no-zone", action="store_true")
+    ap.add_argument("--cls", default="Bot", help="bot class in the module (StormBot for storm.py)")
+    ap.add_argument("--late", type=float, default=240.0, help='when "all of them late" starts (s); 9999 = never')
+    ap.add_argument("--no-hunters", action="store_true", help="mechanics check: no hunters at all")
+    ap.add_argument("--tracking", default="omni", choices=["omni", "seen"])
     ap.add_argument("--laser-only", action="store_true", help="hunters' secondary is always a laser (pre-v7 sim)")
     for k_ in DIFF:
         ap.add_argument("--" + k_, type=float, default=None)
@@ -764,10 +799,13 @@ def main():
     mod = load_bot(args.bot)
     for kv in args.overrides:
         k, v = kv.split("=")
-        setattr(mod.Bot, k, type(getattr(mod.Bot, k))(eval(v)))
-    g = mod.Geo(os.path.join(ROOT, "data", "map.bin"))
+        C = getattr(mod, args.cls)
+        setattr(C, k, type(getattr(C, k))(eval(v)))
+    g = Geo(os.path.join(ROOT, "data", "map.bin"))
     rng = random.Random(args.seed)
-    kw = {"zone_on": not args.no_zone, "secondaries": ("laser",) if args.laser_only else SECONDARIES}
+    LATE["t"] = args.late
+    MODE.update(hunters=not args.no_hunters, tracking=args.tracking)
+    kw = {"zone_on": not args.no_zone, "secondaries": ("laser",) if args.laser_only else SECONDARIES, "cls": args.cls}
     if args.no_zone:
         kw["max_t"] = 300.0
     res = [run_trial(mod, g, rng, **kw) for _ in range(args.trials)]
@@ -777,6 +815,10 @@ def main():
     c4 = [r["c4"] for r in res if r["c4"] is not None]
     allt = sorted(x for r in res for x in r["times"])
     label = args.name or os.path.basename(args.bot)
+    wins = sum(1 for r in res if r["score"] >= 15 or r["res"] in ("win", "timeout"))
+    h380 = [r["hp380"] for r in res if r["hp380"] is not None]
+    print(f"{label:24s} storm-wins {wins}/{n} | alive@380s {len(h380)}/{n} hp@380 {sum(h380)/max(len(h380),1):5.0f} "
+          f"(max_hp {sum(r['maxhp'] for r in res)/n:5.0f}) | roof-ticks {sum(r['roof'] for r in res)/n:5.0f} loud-ticks {sum(r['loud'] for r in res)/n:4.0f}")
     print(f"{label:24s} SCORE {sum(sc)/n:.2f} (kills {sum(ks)/n:.2f} + zone {sum(r['zd'] for r in res)/n:.2f}) median {sc[n//2]} | drops {sum(r['drops'] for r in res)/n:.2f} | cubes {sum(r['cubes'] for r in res)/n:4.1f}"
           f" (at 4th kill {sum(c4)/max(len(c4),1):4.1f}) | laser {sum(r['laser'] for r in res)}/{n} | surv {sum(r['t'] for r in res)/n:4.0f}s"
           f" | tick p99 {allt[int(len(allt)*.99)]:.2f} max {allt[-1]:.1f} ms")
