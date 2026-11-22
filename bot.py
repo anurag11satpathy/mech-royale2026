@@ -6,7 +6,7 @@ import gc, math, os, random, time
 from collections import deque
 
 import mechfight as mf
-from geo import Geo, AStar
+from geo import Geo, AStar, np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PI = math.pi
@@ -100,7 +100,10 @@ class Bot:
     USE_ANCHOR = True    # v10: fight from pre-picked cover pockets, ambush approaching hunters, reset HP there
     ANCHOR_RESET = 0.0   # with no hunter in sight, heal at the anchor below this HP fraction
     ANCHOR_HOLD_R = 5.0  # metres we may jitter around the anchor while fighting from it
-    USE_LCT = False       # v9 laser-cycle timing: duck before a ready enemy laser can fire, fight in its cooldown
+    USE_TAC = True       # numpy tactical grid: stand where exactly ONE enemy (our target) sees us, cover 1 step away
+    TAC_EVERY = 2        # recompute every N decisions (0.2 s)
+    USE_DANGER = True    # danger-weighted A*: tiles seen by 1 / 2+ enemies cost x2 / x4
+    USE_LCT = True       # v9 laser-cycle timing: duck before a ready enemy laser can fire, fight in its cooldown
     LCT_EXPO = 0.35      # seconds a ready laser hunter may see us before we duck
     LCT_COLD = 1.7       # seconds after an enemy laser shot during which it can't fire again (1.65 cooldown)
     LCT_MAXHIDE = 3.2    # longest duck (their full charge + 2 s hold auto-fires by ~2.75 s)
@@ -164,6 +167,22 @@ class Bot:
         self.stalling = False
         self.las_fire = {}          # enemy id -> last time its laser fired
         self.anchors = anchor_spots(self.geo) if self.USE_ANCHOR else []
+        self.tac_ok = np is not None and self.USE_TAC
+        self.tac_pt, self.tac_sc, self.tac_n = None, 1e9, 0
+        self.cur_threats = []
+        if self.tac_ok:
+            offs = [(0.0, 0.0)]
+            for r in (4.0, 8.0, 12.0, 18.0, 25.0):
+                for k in range(16):
+                    a = k * TAU / 16 + (0.2 if r in (8.0, 18.0) else 0.0)
+                    offs.append((math.cos(a) * r, math.sin(a) * r))
+            self.tac_off = np.array(offs, dtype=np.float32)
+            dd = np.hypot(self.tac_off[:, None, 0] - self.tac_off[None, :, 0], self.tac_off[:, None, 1] - self.tac_off[None, :, 1])
+            self.tac_nb = (dd <= 5.5) & (dd > 0.1)                # 1-step neighbours (cover a step away)
+            self.tac_dist = np.hypot(self.tac_off[:, 0], self.tac_off[:, 1])
+            # warm numpy up during hello (first calls are ~10x slower) so no match tick pays for it
+            for _ in range(3):
+                self.geo.los_many(np.zeros((400, 3), np.float32) + 1.0, np.zeros((400, 3), np.float32) + 50.0)
         self.anchor = None
         self.anchor_t = -99.0
         self.expo = {}              # enemy id -> since when a READY laser hunter has had sight of us
@@ -246,6 +265,86 @@ class Bot:
             if sc < bs:
                 bs, best = sc, (ax, ay, az)
         return best
+
+    def tac_pick(self, x, y, z, foes, focus_id, wants_cover):
+        """Score ~80 nearby ground spots with exact LOS (numpy) against up to 4 enemies.
+        foes: [(id, fx, fy, fz, center_z)]. Returns (px, py, score)."""
+        g = self.geo
+        if not foes:
+            return x, y, 0.0
+        P = self.tac_off + np.array([x, y], dtype=np.float32)
+        I = ((P[:, 0] - g.x0) * g.ninv).astype(np.int32); J = ((P[:, 1] - g.y0) * g.ninv).astype(np.int32)
+        ok = (I >= 0) & (J >= 0) & (I < g.nnx) & (J < g.nny)
+        I = np.clip(I, 0, g.nnx - 1); J = np.clip(J, 0, g.nny - 1)
+        ok &= g.NAVn[J, I] > 0
+        zcx, zcy, zr = self.zone_at(self.zone, self.t + 8.0)
+        ok &= np.hypot(P[:, 0] - zcx, P[:, 1] - zcy) < zr - 10.0
+        ok[0] = True                                            # we can always stay put
+        i2 = np.clip(((P[:, 0] - g.x0) * g.inv).astype(np.int32), 0, g.nx - 1)
+        j2 = np.clip(((P[:, 1] - g.y0) * g.inv).astype(np.int32), 0, g.ny - 1)
+        Pz = g.Gn[j2, i2]
+        Pz[0] = z
+        nc, nf = len(P), len(foes)
+        tops = np.stack([P[:, 0], P[:, 1], Pz + 8.8], axis=1)
+        A = np.repeat(np.array([[f[1], f[2], f[3] + 8.0] for f in foes], dtype=np.float32), nc, axis=0)
+        vis = g.los_many(A, np.tile(tops, (nf, 1))).reshape(nf, nc)
+        fi = next((k for k, f in enumerate(foes) if f[0] == focus_id), 0)
+        f = foes[fi]
+        muz = np.stack([P[:, 0], P[:, 1], Pz + 7.0], axis=1)
+        shoot = g.los_many(muz, np.repeat(np.array([[f[1], f[2], f[4]]], dtype=np.float32), nc, axis=0))
+        nvis = vis.sum(axis=0)
+        hidden = nvis == 0
+        cover1 = (self.tac_nb & hidden[None, :]).any(axis=1)
+        dfoc = np.hypot(P[:, 0] - f[1], P[:, 1] - f[2])
+        sc = self.tac_dist * 0.6
+        iso = (nvis == 1) & vis[fi] & shoot
+        sc = np.where(iso, sc - (15.0 if wants_cover else 40.0), sc)
+        sc = np.where(hidden, sc - (35.0 if wants_cover else 10.0), sc)
+        sc = np.where((nvis == 1) & ~vis[fi], sc - 20.0, sc)
+        sc = sc + 60.0 * np.maximum(nvis - 1, 0)
+        sc = np.where(cover1, sc - 15.0, sc)
+        sc = np.where((dfoc < 50) | (dfoc > 200), sc + 10.0, sc)
+        sc = np.where(ok, sc, 1e9)
+        k = int(np.argmin(sc))
+        return float(P[k, 0]), float(P[k, 1]), float(sc[k])
+
+    def danger_penalty(self, sx, sy, gx, gy):
+        """Nav-cell cost multipliers for A*: x2 if one known enemy can see the tile, x4 if two or more."""
+        g = self.geo
+        th = self.cur_threats[:3]
+        if not th or not self.tac_ok:
+            return None
+        x0, x1 = min(sx, gx) - 40, max(sx, gx) + 40
+        y0, y1 = min(sy, gy) - 40, max(sy, gy) + 40
+        i0 = max(0, int((x0 - g.x0) * g.ninv)); i1 = min(g.nnx - 1, int((x1 - g.x0) * g.ninv))
+        j0 = max(0, int((y0 - g.y0) * g.ninv)); j1 = min(g.nny - 1, int((y1 - g.y0) * g.ninv))
+        stride = max(1, int(math.sqrt(max(1, (i1 - i0 + 1) * (j1 - j0 + 1)) / 500.0)))
+        JJ, II = np.mgrid[j0:j1 + 1:stride, i0:i1 + 1:stride]
+        II = II.ravel(); JJ = JJ.ravel()
+        keep = g.NAVn[JJ, II] > 0
+        II, JJ = II[keep], JJ[keep]
+        if len(II) == 0:
+            return None
+        cx = g.x0 + (II + 0.5) * g.ncs; cy = g.y0 + (JJ + 0.5) * g.ncs
+        i2 = np.clip(((cx - g.x0) * g.inv).astype(np.int32), 0, g.nx - 1)
+        j2 = np.clip(((cy - g.y0) * g.inv).astype(np.int32), 0, g.ny - 1)
+        cz = g.Gn[j2, i2] + 4.5
+        cnt = np.zeros(len(II), dtype=np.int32)
+        for tx, ty, tz in th:
+            near = np.hypot(cx - tx, cy - ty) < 200
+            if not near.any():
+                continue
+            A = np.repeat(np.array([[tx, ty, tz + 8.0]], dtype=np.float32), int(near.sum()), axis=0)
+            Bq = np.stack([cx[near], cy[near], cz[near]], axis=1)
+            cnt[np.nonzero(near)[0]] += g.los_many(A, Bq, step=3.0, kmax=70).astype(np.int32)
+        pen = {}
+        for (i, j, c) in zip(II.tolist(), JJ.tolist(), cnt.tolist()):
+            if c:
+                m = 2.0 if c == 1 else 4.0
+                for dj in range(stride):
+                    for di in range(stride):
+                        pen[(j + dj) * g.nnx + i + di] = m
+        return pen
 
     def track_lasers(self, enemies, obs, t, x, y):
         """Last-fire time of every laser hunter (beams, laser hits on us, laser sounds by bearing) and how long a
@@ -481,7 +580,8 @@ class Bot:
         need = (self.path is None or self.path_goal is None
                 or math.hypot(self.path_goal[0] - gx, self.path_goal[1] - gy) > 12 or t - self.path_t > 5)
         if need and self.planner is None:
-            self.planner = AStar(g, (x, y), (gx, gy))
+            pen = self.danger_penalty(x, y, gx, gy) if (self.USE_DANGER and self.cur_threats) else None
+            self.planner = AStar(g, (x, y), (gx, gy), penalty=pen)
             self.planner_goal = (gx, gy)
         if self.planner is not None:
             if self.planner.step(0 if self.heavy else 450):
@@ -858,6 +958,7 @@ class Bot:
         threats = [(e[0]["pos"][0], e[0]["pos"][1], e[0]["pos"][2]) for e in enemies if e[1] < 260]
         threats += [(gx, gy, g.ground(gx, gy)) for (_, gx, gy) in self.ghosts]
         threats.sort(key=lambda q: (q[0] - x) ** 2 + (q[1] - y) ** 2)
+        self.cur_threats = [(e[0]["pos"][0], e[0]["pos"][1], e[0]["pos"][2]) for e in enemies if e[1] < 260]
         if self.USE_LCT:
             self.track_lasers(enemies, obs, t, x, y)
         if self.USE_ANCHOR and (self.anchor is None or t - self.anchor_t > 6.0 or
@@ -964,6 +1065,8 @@ class Bot:
 
         # ---------------- movement intent
         self.ambush = False
+        if not any(e[2] for e in enemies):
+            self.tac_pt, self.tac_sc = None, 1e9
         self.peek_active = False
         if self.state != "DUEL":
             self.peek = None
@@ -1039,6 +1142,24 @@ class Bot:
                 label = "PEEK-" + self.peek["phase"]
                 want_boost = self.peek["phase"] == "cover" and math.hypot(
                     self.peek["C"][0] - x, self.peek["C"][1] - y) > 10
+            elif self.tac_ok and any(e[2] for e in enemies) and not finishable and z < g.ground(x, y) + 3.0:
+                self.tac_n += 1
+                if self.tac_pt is None or self.tac_n % self.TAC_EVERY == 0:
+                    foes = sorted(((e[0]["id"], e[0]["pos"][0], e[0]["pos"][1], e[0]["pos"][2], e[3])
+                                   for e in enemies if e[1] < 250), key=lambda f: (f[1] - x) ** 2 + (f[2] - y) ** 2)[:4]
+                    wants_cover = reloading or frac < 0.5 or (laser is not None and laser[1].get("cooldown", 0) > 0.6
+                                                             and (laser[1].get("charge") or 0) == 0)
+                    px_, py_, sc_ = self.tac_pick(x, y, z, foes, m["id"], wants_cover)
+                    if self.tac_pt is None or sc_ < self.tac_sc - 4.0 or \
+                            math.hypot(self.tac_pt[0] - x, self.tac_pt[1] - y) < 1.5:
+                        self.tac_pt, self.tac_sc = (px_, py_), sc_
+                    self.heavy = True
+                tpx, tpy = self.tac_pt
+                tdd = math.hypot(tpx - x, tpy - y)
+                if tdd > 1.5:
+                    mvx, mvy = self.nav_to(x, y, z, tpx, tpy) if tdd > 6 else ((tpx - x) / tdd, (tpy - y) / tdd)
+                    want_boost = tdd > 8 and me["energy"] > 35
+                label = "TAC"
             elif (vis or d < 60) and self.USE_ANCHOR and self.anchor is not None and not finishable and \
                     math.hypot(self.anchor[0] - x, self.anchor[1] - y) < 25:
                 adx, ady = self.anchor[0] - x, self.anchor[1] - y
