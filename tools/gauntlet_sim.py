@@ -245,6 +245,7 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
     laser_t = None
     cubes_at_4th = None
     short_until = -99.0
+    lit_spent_t = -99.0
     drops = []             # {"id", "pos", "lands_at", "progress", "taken"}
     drops_got = 0
     shells = []            # [x, y, z, vx, vy, vz, owner]
@@ -456,20 +457,43 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
                 charge = 0.0
             slot1["cooldown"] -= 0.1
         elif slot1 and slot1["kind"] == "lightning":
+            # full rules: 60 dmg / 0.25 s, 3 energy a shot, nearest target in 45 m and the 30-degree cone with LOS,
+            # chains to 2 more within 14 m (x0.7 per jump); a hit mech carrying a laser is shorted for 2 s
             held = a["fire"][1]
-            slot1["cooldown"] -= 0.1
-            if held and slot1["cooldown"] <= 0 and me.body.energy > LIT["energy"]:
-                me.body.energy -= LIT["energy"] * 0.4
+            for sub in range(2):
+                slot1["cooldown"] -= DT
+                if not (held and slot1["cooldown"] <= 0 and me.body.energy >= LIT["energy"]):
+                    continue
+                me.body.energy -= LIT["energy"]; slot1["cooldown"] = LIT["cooldown"]; lit_spent_t = t
                 tg = None
-                for tid, (tx, ty, tz), rr, hh in our_targets():
-                    d = math.hypot(tx - mx, ty - my)
-                    if d < LIT["range"] and abs(wrap(math.atan2(ty - my, tx - mx) - me.aim[0])) < math.radians(LIT["cone_deg"] / 2) \
-                            and g.los(mx, my, mz + 7, tx, ty, tz + hh * 0.5) and (tg is None or d < tg[0]):
-                        tg = (d, tid)
-                if tg:
-                    our_hit(tg[1], LIT["damage"] * 0.4 * me.dmg_mult(), "lightning"); dealt = True
+                for tid, tp, rr, hh in our_targets():
+                    d = math.hypot(tp[0] - mx, tp[1] - my)
+                    if d < LIT["range"] and abs(wrap(math.atan2(tp[1] - my, tp[0] - mx) - me.aim[0])) < math.radians(LIT["cone_deg"] / 2) \
+                            and g.los(mx, my, mz + 7, tp[0], tp[1], tp[2] + hh * 0.5) and (tg is None or d < tg[0]):
+                        tg = (d, tid, tp)
+                if not tg:
+                    continue
+                hitset, cur, dmg = {tg[1]}, tg, LIT["damage"] * me.dmg_mult()
+                for jump in range(LIT["chain"] + 1):
+                    our_hit(cur[1], dmg, "lightning"); dealt = True
+                    for f in foes:
+                        if f.id == cur[1] and f.sec == "laser":
+                            f.lcharge, f.short_until = 0.0, t + LIT["short_s"]
+                    nxt = None
+                    for tid, tp, rr, hh in our_targets():
+                        if tid in hitset:
+                            continue
+                        dd = math.hypot(tp[0] - cur[2][0], tp[1] - cur[2][1])
+                        if dd < LIT["chain_range"] and (nxt is None or dd < nxt[0]):
+                            nxt = (dd, tid, tp)
+                    if nxt is None:
+                        break
+                    hitset.add(nxt[1]); cur, dmg = nxt, dmg * LIT["chain_falloff"]
         ox_, oy_ = me.body.x, me.body.y
+        e_before = me.body.energy
         me.body.step(a, 0.5 if charge > 0 else 1.0)
+        if t - lit_spent_t < 0.6 and me.body.energy > e_before:
+            me.body.energy = e_before          # energy regen waits 0.6 s after spending
         me.vel = ((me.body.x - ox_) / 0.1, (me.body.y - oy_) / 0.1)
         vel_hist.append(me.vel)
         mx, my, mz = me.pos
@@ -578,7 +602,7 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
                         if d < 380:
                             sounds.append({"kind": "laser", "bearing": wrap(brg_to_me + math.pi), "dist": dist_word(d), "age": 0.05})
                         f.lcharge, f.lcd = 0.0, LAS["cooldown"]
-                elif f.lcd <= 0 and sees and react and d < LAS["range"]:
+                elif f.lcd <= 0 and sees and react and d < LAS["range"] and t >= getattr(f, "short_until", -99.0):
                     f.lcharge = 0.1
             if f.sec == "lightning":
                 if d < LIT["range"] and can_shoot and react and f.energy > LIT["energy"]:
