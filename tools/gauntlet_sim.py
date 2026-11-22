@@ -35,6 +35,7 @@ LAS = CFG["weapons"]["laser"]
 LIT = CFG["weapons"]["lightning"]
 MOR = CFG["weapons"]["mortar"]
 ZCFG = CFG["zone"]
+DCFG = CFG["drops"]
 SECONDARIES = ("laser", "lightning", "mortar")   # house bots' second weapon (loot weights 1:1:1)
 UPG = {u["id"]: u for u in CFG["upgrades"]}
 THRESH = CFG["cubes"]["upgrade_thresholds"]
@@ -244,6 +245,8 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
     laser_t = None
     cubes_at_4th = None
     short_until = -99.0
+    drops = []             # {"id", "pos", "lands_at", "progress", "taken"}
+    drops_got = 0
     shells = []            # [x, y, z, vx, vy, vz, owner]
     zone_deaths = 0
     t = 0.0
@@ -292,16 +295,27 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
                 f = spawn(queue.pop(0)); spawned += 1
                 if f:
                     foes.append(f)
+        for di, ct in enumerate(DCFG["times"]):
+            if zone_on and len(drops) == di and t >= ct:
+                zph, _, _, _ = zone_now(zphases, t)
+                nc, nr = zph["next_center"], zph["next_radius"]
+                for _ in range(300):
+                    a = rng.uniform(0, 2 * math.pi); rr = nr * DCFG["spread"] * math.sqrt(rng.random())
+                    px, py = nc[0] + math.cos(a) * rr, nc[1] + math.sin(a) * rr
+                    if g.NAV[g.ncell(px, py)] == 1:
+                        break
+                drops.append({"id": 20000 + di, "pos": [px, py, g.ground(px, py)], "lands_at": ct + DCFG["fall_s"],
+                              "progress": 0.0, "taken": False})
         alive = [f for f in foes if f.hp > 0]
         if kills >= 4 and cubes_at_4th is None:
             cubes_at_4th = me.cubes
         if not alive and not queue:
             return dict(res="win", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths,
+                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got,
                         score=sum(1 for f in foes if f.hp <= 0))
         if me.hp <= 0:
             return dict(res="dead", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths,
+                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got,
                         score=sum(1 for f in foes if f.hp <= 0))
         mx, my, mz = me.pos
 
@@ -352,8 +366,11 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
             o = me.offers[0]
             offer = {"id": o["id"], "expires": o["exp"], "choices": [{"id": c, "name": c, "desc": ""} for c in o["ch"]]}
         obs = json.loads(json.dumps(BASE))
+        obs_drops = [{"id": d_["id"], "pos": d_["pos"], "radius": DCFG["radius"], "lands_in": round(max(0.0, d_["lands_at"] - t), 2),
+                      "capture_s": DCFG["capture_s"], "progress": round(d_["progress"], 2),
+                      "holder": me.id if d_["progress"] > 0 else None} for d_ in drops if not d_["taken"]]
         obs.update(tick=k * 2, t=round(t, 2), mechs=mechs, projectiles=projs, events=events, sounds=sounds,
-                   beams=beams, pickups=vis_pk, cubes=vis_cu, crates=vis_cr, drops=[], zone=zone, offer=offer,
+                   beams=beams, pickups=vis_pk, cubes=vis_cu, crates=vis_cr, drops=obs_drops, zone=zone, offer=offer,
                    alive=1 + len(alive) + len(queue))
         obs["self"].update(pos=[mx, my, mz], vel=[me.vel[0], me.vel[1], 0], aim=[round(me.aim[0], 4), round(me.aim[1], 4)],
                            hp=round(me.hp), max_hp=round(me.max_hp), energy=me.body.energy, in_zone=in_zone,
@@ -456,6 +473,22 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
         me.vel = ((me.body.x - ox_) / 0.1, (me.body.y - oy_) / 0.1)
         vel_hist.append(me.vel)
         mx, my, mz = me.pos
+        # ---- supply drops
+        for d_ in drops:
+            if d_["taken"] or t < d_["lands_at"]:
+                continue
+            inside = math.hypot(mx - d_["pos"][0], my - d_["pos"][1]) <= DCFG["radius"]
+            others = any(f.hp > 0 and math.hypot(f.body.x - d_["pos"][0], f.body.y - d_["pos"][1]) <= DCFG["radius"] for f in foes)
+            if inside and not others:
+                d_["progress"] += 0.1
+                if d_["progress"] >= DCFG["capture_s"]:
+                    d_["taken"] = True; drops_got += 1
+                    for _ in range(DCFG["cubes"]):
+                        cubes.append({"id": ids["cube"], "pos": [mx, my, mz]}); ids["cube"] += 1
+                    me.hp = me.max_hp; me.body.energy = 100.0
+                    events.append({"type": "drop", "id": d_["id"], "cubes": me.cubes + DCFG["cubes"]})
+            elif not inside:
+                d_["progress"] = 0.0          # ring emptied: the clock restarts (frozen while contested)
         # ---- cubes
         for cu in list(cubes):
             if math.hypot(cu["pos"][0] - mx, cu["pos"][1] - my) < 3.5 and abs(cu["pos"][2] - mz) < 4.0:
@@ -679,7 +712,7 @@ def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
             if f.hp > 0 and t - f.last_combat > 5.0:
                 f.hp = min(f.max_hp, f.hp + 4.5)
     return dict(res="timeout", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths,
+                laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths, drops=drops_got,
                         score=sum(1 for f in foes if f.hp <= 0))
 
 
@@ -720,7 +753,7 @@ def main():
     c4 = [r["c4"] for r in res if r["c4"] is not None]
     allt = sorted(x for r in res for x in r["times"])
     label = args.name or os.path.basename(args.bot)
-    print(f"{label:24s} SCORE {sum(sc)/n:.2f} (kills {sum(ks)/n:.2f} + zone {sum(r['zd'] for r in res)/n:.2f}) median {sc[n//2]} | cubes {sum(r['cubes'] for r in res)/n:4.1f}"
+    print(f"{label:24s} SCORE {sum(sc)/n:.2f} (kills {sum(ks)/n:.2f} + zone {sum(r['zd'] for r in res)/n:.2f}) median {sc[n//2]} | drops {sum(r['drops'] for r in res)/n:.2f} | cubes {sum(r['cubes'] for r in res)/n:4.1f}"
           f" (at 4th kill {sum(c4)/max(len(c4),1):4.1f}) | laser {sum(r['laser'] for r in res)}/{n} | surv {sum(r['t'] for r in res)/n:4.0f}s"
           f" | tick p99 {allt[int(len(allt)*.99)]:.2f} max {allt[-1]:.1f} ms")
 

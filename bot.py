@@ -51,7 +51,7 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v6"
+    name = "anurag-v7"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
     R_LASER = 130.0      # preferred duel range with a laser
@@ -67,6 +67,9 @@ class Bot:
     STALL_T = 150.0      # ... or this much match time has passed
     FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
     HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
+    USE_DROPS = True     # v7: go for supply drops (+3 cubes, full HP + energy) from ROAM, HEAL and DUEL
+    DROP_MAX_D = 400.0
+    DROP_EARLY = 12.0    # arrive at most this many seconds before it lands
     USE_KITE = False     # split-kite vs 2+ bunched pursuers: built, 3.94 vs 4.16 kills in squad_sim gauntlet -> off
     KITE_GAP = 50.0      # required lead of the nearest pursuer over the second (m)
 
@@ -299,6 +302,27 @@ class Bot:
                     return vx, vy, cd > 10, "END-cover"
             return 0.0, 0.0, False, "END-hold"
         return None
+
+    def drop_target(self, x, y, me, n_los):
+        """Best supply drop to go for now, or None. Drops are always known (obs.drops)."""
+        best, bs = None, 1e18
+        for dr in self.obs.get("drops", ()):
+            dx_, dy_, dz_ = dr["pos"]
+            dd = math.hypot(dx_ - x, dy_ - y)
+            if dd > self.DROP_MAX_D or dz_ - me["pos"][2] > 30:
+                continue
+            holder = dr.get("holder")
+            if holder is not None and holder != self.me_id and dr.get("progress", 0) > 0:
+                continue                      # someone else is capturing it
+            travel = dd / 14.0
+            if dr.get("lands_in", 0) > travel + self.DROP_EARLY:
+                continue                      # too early: don't stand on an empty spot for ages
+            if not self.zone_ok(dx_, dy_, 4.0, travel + 4.0):
+                continue
+            sc = dd + 40.0 * n_los
+            if sc < bs:
+                bs, best = sc, dr
+        return best
 
     def start_climb(self, t, ux, uy, dur=2.5):
         self.climb_start = t
@@ -1008,6 +1032,22 @@ class Bot:
                     mvx, mvy = self.nav_to(x, y, z, ax2, ay2)
                     want_boost = nd > 90 and me["energy"] > 60
                 # else: already in a good spot: stand still (silent)
+
+        # ---------------- v7: supply drops override movement (fight from the ring; 4 s alone = full heal)
+        if self.USE_DROPS and not (self.state == "DUEL" and finishable) and n_los < 3:
+            dr = self.drop_target(x, y, me, n_los)
+            if dr is not None and (not zone_urgent or self.zone_ok(dr["pos"][0], dr["pos"][1], 4.0, 2.0)):
+                ddx, ddy = dr["pos"][0] - x, dr["pos"][1] - y
+                ddd = math.hypot(ddx, ddy)
+                if ddd > 4.0:
+                    mvx, mvy = self.nav_to(x, y, z, dr["pos"][0], dr["pos"][1])
+                    want_boost = ddd > 25 and me["energy"] > 20
+                else:
+                    mvx, mvy = ddx / 4.0, ddy / 4.0   # hold the centre of the ring
+                    want_boost = False
+                label = "DROP"
+                self.peek = None
+                self.peek_active = False
 
         # ---------------- zone bias & dodge
         if not zone_urgent:
