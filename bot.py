@@ -67,6 +67,8 @@ class Bot:
     STALL_T = 150.0      # ... or this much match time has passed
     FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
     HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
+    PRIMARY = "laser"    # weapon we rush to get and never drop: "laser" (range) or "lightning" (brawl)
+    BRAWL_R = 30.0       # duel range with lightning as primary
     USE_DROPS = True     # v7: go for supply drops (+3 cubes, full HP + energy) from ROAM, HEAL and DUEL
     DROP_MAX_D = 400.0
     DROP_EARLY = 12.0    # arrive at most this many seconds before it lands
@@ -247,13 +249,14 @@ class Bot:
                         return vx, vy, True, "HIDE"
                     break
         # --- 1. laser first: grab a nearby laser mid-fight if the target isn't pinning us
-        if laser is None and t < 200:
+        prim_held = laser if self.PRIMARY == "laser" else self.lightning_slot
+        if prim_held is None and t < 200:
             m, d, vis, _ = target
             reach = 300.0 if t < 120 else 90.0
             if not (vis and d < 90) and not finishable:
                 best = None
                 for k, it in self.items.items():
-                    if it[0] != "laser":
+                    if it[0] != self.PRIMARY:
                         continue
                     dd = math.hypot(it[1] - x, it[2] - y)
                     if dd < reach and it[3] - z < 45 and self.zone_ok(it[1], it[2], 10.0, dd / 11.0 + 5) and \
@@ -263,7 +266,7 @@ class Bot:
                     it = best[1]
                     vx, vy, jn = self.go_to(x, y, z, it[1], it[2], it[3], me)
                     self.jump_req = self.jump_req or jn
-                    return vx, vy, best[0] > 20, "GRAB-laser"
+                    return vx, vy, best[0] > 20, "GRAB-" + self.PRIMARY
         # --- split-kite: never take a straight 1v2; run until the nearest pursuer is well ahead of the next
         self.kiting = False
         if self.USE_KITE and not finishable and not endgame:
@@ -302,6 +305,13 @@ class Bot:
                     return vx, vy, cd > 10, "END-cover"
             return 0.0, 0.0, False, "END-hold"
         return None
+
+    def wpref(self, kind):
+        if kind is None:
+            return -1.0
+        if kind == self.PRIMARY:
+            return 4.0
+        return WEAPON_PREF.get(kind, 0.0)
 
     def drop_target(self, x, y, me, n_los):
         """Best supply drop to go for now, or None. Drops are always known (obs.drops)."""
@@ -767,6 +777,7 @@ class Bot:
         gun = slots.get("gun")
         laser = slots.get("laser")
         lightning = slots.get("lightning")
+        self.lightning_slot = lightning
         mortar = slots.get("mortar")
 
         # ---------------- target selection
@@ -912,6 +923,8 @@ class Bot:
                 R = 32.0
             if laser and not lightning:
                 R = self.R_LASER
+            if lightning and self.PRIMARY == "lightning":
+                R = self.BRAWL_R
             if finishable:
                 R = min(R, 70.0)   # close in and keep firing
                 label = "FINISH"
@@ -948,6 +961,8 @@ class Bot:
                     mvx = ux * radial - uy * self.strafe_sign * strafe
                     mvy = uy * radial + ux * self.strafe_sign * strafe
                 want_boost = me["energy"] > 70 or (self.boosting and me["energy"] > 30)
+                if lightning and self.PRIMARY == "lightning":
+                    want_boost = me["energy"] > 85   # keep energy for the arc (3 per shot)
             else:
                 # no line of sight: hunt only if it is alone and we are healthy
                 others = sum(1 for e in enemies if e is not target and
@@ -969,7 +984,7 @@ class Bot:
             for k, it in self.items.items():
                 kind, ix, iy, iz = it[0], it[1], it[2], it[3]
                 dd = math.hypot(ix - x, iy - y)
-                need_laser = kind == "laser" and laser is None
+                need_laser = kind == self.PRIMARY and slots.get(self.PRIMARY) is None
                 lim = 300 if (need_laser and t < 120) else 230
                 if dd > lim or not self.zone_ok(ix, iy, 15.0, dd / 11.0 + 5):
                     continue
@@ -978,7 +993,7 @@ class Bot:
                 if kind == "cube":
                     v = 4.0
                 else:
-                    if kind in slots or WEAPON_PREF.get(kind, 0) <= WEAPON_PREF.get(slot1_kind, -1):
+                    if kind in slots or self.wpref(kind) <= self.wpref(slot1_kind):
                         continue
                     v = (40.0 if t < 120 else 14.0) if need_laser else 6.0
                 v /= (1.0 + dd / 45.0)
@@ -1288,7 +1303,7 @@ class Bot:
                 if w1 is None:
                     act["take"] = p["id"]
                     break
-                if w1["kind"] != "laser" and WEAPON_PREF.get(k, 0) > WEAPON_PREF.get(w1["kind"], 0) and not (w1["kind"] == "laser" and (w1.get("charge") or 0) > 0):
+                if w1["kind"] != self.PRIMARY and self.wpref(k) > self.wpref(w1["kind"]) and not (w1["kind"] == "laser" and (w1.get("charge") or 0) > 0):
                     act["take"] = p["id"]
                     act["drop"] = 1
                     break
