@@ -3,3 +3,4 @@ v1,3e6091d,"Baseline: precomputed LOS/nav grid, lead-aimed gun, DUEL/HEAL/ROAM s
 v2,ed77a60,"Cover-aware healing (wall-hugging cover, own-position hidden check), laser peek cycle from cover, race-based heal triggers (70% vs 2+ bots)",3.29
 v3,b704926,"Heal 42/55/65% + kill-finish override (never retreat from a <=2 s kill), peek only when not winning, crate/drone/rooftop loot farming, armor/plating/nanites then weapon dmg upgrades",3.88
 v4,380708a,"Focus-fire fastest kill, irregular jukes + laser-aim sidestep + stronger dodge, no laser charge when rushed, squad-adaptive loot pref, fix false-stuck mid-duel climbs; isolation built but OFF (lost in squad_sim)",3.33
+v5,4995b8e,"v3 base + laser-first (300 m detour, never drop), math upgrade plan (plating/nanites/drum mag/lens), attacker-first targeting + back-armor aim guard, end-game hold near centre; hide & kite built but OFF (no sim gain). Sim gauntlet: tie with v3",
