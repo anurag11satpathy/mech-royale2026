@@ -51,20 +51,20 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v6a"
+    name = "anurag-v6b"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
     R_LASER = 130.0      # preferred duel range with a laser
     HEAL_EXIT = 0.85     # leave HEAL at this HP fraction
     PREHEAL = 0.0        # with no enemy in sight, go heal (cover + stand still) below this HP fraction
-    HEAL_BASE = 0.55     # HEAL below this HP fraction (probe A: early heal; v6 = 0.42)
-    HEAL_MULTI = 0.68    # ... or below this when 2+ see / hit us (probe A; v6 = 0.55)
+    HEAL_BASE = 0.42     # HEAL below this HP fraction
+    HEAL_MULTI = 0.55    # ... or below this when 2+ see / hit us
     HEAL_FIRE = True     # keep shooting while retreating: +0.65 kills in gauntlet_sim (28/30 deaths were mid-retreat)
     # v6 farming-first / wave-stalling (tuned in tools/gauntlet_sim.py)
     FARM_FIRST = True
     STALL_KILLS = 3      # once we have this many kills, don't take the next one until geared
-    CUBE_TARGET = 10     # "geared" = this many cubes ...
-    STALL_T = 150.0      # ... or this much match time has passed
+    CUBE_TARGET = 14     # "geared" = this many cubes ... (probe B: deep farm)
+    STALL_T = 220.0      # ... or this much match time has passed (probe B)
     FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
     HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
     USE_KITE = False     # split-kite vs 2+ bunched pursuers: built, 3.94 vs 4.16 kills in squad_sim gauntlet -> off
