@@ -51,7 +51,7 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v5"
+    name = "anurag-v6"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
     R_LASER = 130.0      # preferred duel range with a laser
@@ -59,7 +59,14 @@ class Bot:
     PREHEAL = 0.0        # with no enemy in sight, go heal (cover + stand still) below this HP fraction
     HEAL_BASE = 0.42     # HEAL below this HP fraction
     HEAL_MULTI = 0.55    # ... or below this when 2+ see / hit us
-    HEAL_FIRE = False    # keep shooting while retreating (regen is impossible while a hunter chases anyway)
+    HEAL_FIRE = True     # keep shooting while retreating: +0.65 kills in gauntlet_sim (28/30 deaths were mid-retreat)
+    # v6 farming-first / wave-stalling (tuned in tools/gauntlet_sim.py)
+    FARM_FIRST = True
+    STALL_KILLS = 3      # once we have this many kills, don't take the next one until geared
+    CUBE_TARGET = 10     # "geared" = this many cubes ...
+    STALL_T = 150.0      # ... or this much match time has passed
+    FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
+    HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
     USE_KITE = False     # split-kite vs 2+ bunched pursuers: built, 3.94 vs 4.16 kills in squad_sim gauntlet -> off
     KITE_GAP = 50.0      # required lead of the nearest pursuer over the second (m)
 
@@ -113,6 +120,9 @@ class Bot:
         self.end_hold = False
         self.jump_req = False
         self.kiting = False
+        self.kills = 0
+        self.stalling = False
+        self.hc, self.hc_t = None, -99.0
         self.times = []
         self.n = 0
         # The map grids are big lists the GC would otherwise rescan on every full collection (~2 ms+).
@@ -656,6 +666,10 @@ class Bot:
                 self.items.pop("p:%s" % ev.get("id"), None)
             elif et == "took":
                 self.items.pop("p:%s" % ev.get("id"), None)
+            elif et == "kill" and (ev.get("target") or 0) < 100:
+                self.kills += 1
+                if ev.get("target") == self.target_id:
+                    self.target_id = None
             elif et == "kill" and ev.get("target") == self.target_id:
                 self.target_id = None
         while self.dmg_log and t - self.dmg_log[0][0] > 4.0:
@@ -769,6 +783,10 @@ class Bot:
             winning = thp / max(target[0].get("max_hp", 1400), 1) < frac - 0.15 or \
                 (dps_in > 0 and ttk < 0.6 * ttd)
             losing = ttd < 1.25 * ttk
+        geared = me.get("cubes", 0) >= self.CUBE_TARGET or t > self.STALL_T
+        self.stalling = stalling = self.FARM_FIRST and self.kills >= self.STALL_KILLS and not geared
+        if stalling:
+            finishable = False     # taking this kill would bring the next wave before we're geared
         self.finishable = finishable
         zr_now = self.zone_at(self.zone, t)[2]
         endgame = zr_now <= 75.0
@@ -791,9 +809,18 @@ class Bot:
                 heal = True        # full HP is the win condition in the final circles
             if finishable and n_los <= 2:
                 heal = False
+            if heal and self.HEAL_COVER_MAX > 0 and threats and n_los >= 1 and frac > 0.2:
+                # a long retreat under fire is worse than fighting: only run if cover is a short dash away
+                if t - self.hc_t > 0.5:
+                    self.hc = self.find_cover(x, y, z, threats)
+                    self.hc_t = t
+                if self.hc is None or math.hypot(self.hc[0] - x, self.hc[1] - y) > self.HEAL_COVER_MAX:
+                    heal = False
             if heal and me["in_zone"]:
                 self.state = "HEAL"
                 self.cover = None
+            elif stalling and target and frac >= 0.5 and n_los <= 1 and not (target[2] and target[1] < 60):
+                self.state = "ROAM"    # wave-stall: farm instead of duelling the hunter
             elif target and (target[1] < 230 or target[2]):
                 self.state = "DUEL"
             else:
@@ -910,6 +937,9 @@ class Bot:
             # ROAM: route to the best-value loot (weapons, cubes, crates, drones, drops), else hold the zone anchor
             slot1_kind = w1["kind"] if w1 else None
             pressured = any(e[2] and e[1] < 160 or e[1] < 90 for e in enemies) or t - self.last_combat_t < 4
+            if self.FARM_UNDER_PRESSURE and (stalling or self.kills < self.STALL_KILLS):
+                # one hunter around but not on top of us: keep farming
+                pressured = n_los >= 2 or any(e[2] and e[1] < 60 for e in enemies)
             calm = not pressured and frac > 0.5 and not endgame
             best_v, goal = 0.0, None   # goal = (x, y, z, kind, id)
             for k, it in self.items.items():
@@ -1095,6 +1125,8 @@ class Bot:
             on_target = abs(wrap(ay - yaw)) * hd < rad * 0.8 + 0.4 and abs(ap - pitch) * hd < 3.0
             in_heal = (self.state == "HEAL" or self.end_hold) and not under_fire and d > 50 and not finishable \
                 and not (self.HEAL_FIRE and vis)
+            if self.stalling and m.get("id", 0) < 100 and m.get("hp", 1400) < 0.35 * m.get("max_hp", 1400) and frac >= 0.4:
+                in_heal = True     # wave-stall: don't take the kill that brings the next wave
 
             # laser: charge when it can see, release at full charge on target
             if laser and not in_heal:
