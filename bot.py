@@ -29,6 +29,36 @@ WEAPON_PREF = {"laser": 3.0, "lightning": 2.5, "mortar": 1.0, "gun": 0.0}
 GHOST_DIST = {"gun": 120, "laser": 150, "mortar": 160, "lightning": 35, "npc": 40}
 
 
+_ANCHORS = None
+
+
+def anchor_spots(geo):
+    """Cover pockets: walkable cells hugging buildings with a wall within 4.5 m in 3-9 of 16 directions (cover a
+    step away) and open ground out to 40 m in >= 4 directions (room to shoot). Cached per process."""
+    global _ANCHORS
+    if _ANCHORS is not None:
+        return _ANCHORS
+    out = []
+    dirs = [(math.cos(k * math.pi / 8), math.sin(k * math.pi / 8)) for k in range(16)]
+    for J in range(1, geo.nny - 1, 2):
+        for I in range(1, geo.nnx - 1, 2):
+            c = J * geo.nnx + I
+            if geo.NAV[c] != 3:
+                continue
+            cx, cy = geo.ncenter(c)
+            z = geo.ground(cx, cy)
+            near = open_ = 0
+            for ux, uy in dirs:
+                if geo.blocked_at(cx + ux * 4.5, cy + uy * 4.5, z, 4.5):
+                    near += 1
+                elif not geo.blocked_at(cx + ux * 20, cy + uy * 20, z, 20) and not geo.blocked_at(cx + ux * 40, cy + uy * 40, z, 40):
+                    open_ += 1
+            if 3 <= near <= 9 and open_ >= 4:
+                out.append((cx, cy, z, near, open_))
+    _ANCHORS = out
+    return out
+
+
 def lightning_close(lightning, d):
     """With lightning in hand and the target nearly in arc range, brawl instead of peeking."""
     return lightning is not None and d < lightning[1]["stats"]["range"] * 1.3
@@ -51,7 +81,7 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v9"
+    name = "anurag-v10"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
     R_LASER = 130.0      # preferred duel range with a laser
@@ -67,7 +97,10 @@ class Bot:
     STALL_T = 150.0      # ... or this much match time has passed
     FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
     HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
-    USE_LCT = True       # v9 laser-cycle timing: duck before a ready enemy laser can fire, fight in its cooldown
+    USE_ANCHOR = True    # v10: fight from pre-picked cover pockets, ambush approaching hunters, reset HP there
+    ANCHOR_RESET = 0.0   # with no hunter in sight, heal at the anchor below this HP fraction
+    ANCHOR_HOLD_R = 5.0  # metres we may jitter around the anchor while fighting from it
+    USE_LCT = False       # v9 laser-cycle timing: duck before a ready enemy laser can fire, fight in its cooldown
     LCT_EXPO = 0.35      # seconds a ready laser hunter may see us before we duck
     LCT_COLD = 1.7       # seconds after an enemy laser shot during which it can't fire again (1.65 cooldown)
     LCT_MAXHIDE = 3.2    # longest duck (their full charge + 2 s hold auto-fires by ~2.75 s)
@@ -130,6 +163,9 @@ class Bot:
         self.kills = 0
         self.stalling = False
         self.las_fire = {}          # enemy id -> last time its laser fired
+        self.anchors = anchor_spots(self.geo) if self.USE_ANCHOR else []
+        self.anchor = None
+        self.anchor_t = -99.0
         self.expo = {}              # enemy id -> since when a READY laser hunter has had sight of us
         self.hc, self.hc_t = None, -99.0
         self.times = []
@@ -193,6 +229,23 @@ class Bot:
                         return i
             return 100 + (UPGRADE_REST.index(u) if u in UPGRADE_REST else 99)
         return min(range(len(choices)), key=lambda i: rank(choices[i]))
+
+    def pick_anchor(self, x, y, threats):
+        """Best cover pocket inside the zone we'll be in 30 s from now, near us and toward the next centre,
+        not currently in a known hunter's face."""
+        nx_, ny_ = self.zone["next_center"]
+        best, bs = None, 1e18
+        for ax, ay, az, near, open_ in self.anchors:
+            d = math.hypot(ax - x, ay - y)
+            if d > 160 or not self.zone_ok(ax, ay, 20.0, 30.0):
+                continue
+            sc = d + 0.25 * math.hypot(ax - nx_, ay - ny_) - 3.0 * open_
+            for tx, ty, tz in threats[:3]:
+                if math.hypot(ax - tx, ay - ty) < 60:
+                    sc += 80.0
+            if sc < bs:
+                bs, best = sc, (ax, ay, az)
+        return best
 
     def track_lasers(self, enemies, obs, t, x, y):
         """Last-fire time of every laser hunter (beams, laser hits on us, laser sounds by bearing) and how long a
@@ -807,6 +860,11 @@ class Bot:
         threats.sort(key=lambda q: (q[0] - x) ** 2 + (q[1] - y) ** 2)
         if self.USE_LCT:
             self.track_lasers(enemies, obs, t, x, y)
+        if self.USE_ANCHOR and (self.anchor is None or t - self.anchor_t > 6.0 or
+                                not self.zone_ok(self.anchor[0], self.anchor[1], 10.0, 15.0)):
+            if not any(e[2] for e in enemies):        # re-pick only between fights
+                self.anchor = self.pick_anchor(x, y, threats)
+                self.anchor_t = t
 
         # ---------------- weapons
         w0 = me["weapons"][0]
@@ -878,6 +936,9 @@ class Bot:
                     or (frac < 0.65 and n_los >= 3)
                     or (frac < 0.50 and losing)
                     or ttd < 2.5)
+            if self.USE_ANCHOR and frac < self.ANCHOR_RESET and n_los == 0 and not finishable and \
+                    not dps_in and t - self.last_combat_t > 1.0:
+                heal = True        # clean reset before the next hunter: top up in cover
             if self.PREHEAL and frac < self.PREHEAL and n_los == 0 and not finishable:
                 heal = True        # no one in sight: top up before the next hunter arrives
             if endgame and frac < 0.8:
@@ -902,6 +963,7 @@ class Bot:
                 self.state = "ROAM"
 
         # ---------------- movement intent
+        self.ambush = False
         self.peek_active = False
         if self.state != "DUEL":
             self.peek = None
@@ -977,6 +1039,20 @@ class Bot:
                 label = "PEEK-" + self.peek["phase"]
                 want_boost = self.peek["phase"] == "cover" and math.hypot(
                     self.peek["C"][0] - x, self.peek["C"][1] - y) > 10
+            elif (vis or d < 60) and self.USE_ANCHOR and self.anchor is not None and not finishable and \
+                    math.hypot(self.anchor[0] - x, self.anchor[1] - y) < 25:
+                adx, ady = self.anchor[0] - x, self.anchor[1] - y
+                if math.hypot(adx, ady) > self.ANCHOR_HOLD_R:
+                    mvx, mvy = self.nav_to(x, y, z, self.anchor[0], self.anchor[1])
+                    want_boost = True
+                else:
+                    if t > self.strafe_until:
+                        self.strafe_sign = -self.strafe_sign
+                        self.strafe_until = t + self.rng.uniform(0.4, 1.0)
+                    ux, uy = (tx - x) / (d or 1), (ty - y) / (d or 1)
+                    mvx = -uy * self.strafe_sign * 0.6 + adx / 3.0
+                    mvy = ux * self.strafe_sign * 0.6 + ady / 3.0
+                label = "ANCHOR-fight"
             elif vis or d < 60:
                 if t > self.strafe_until:
                     self.strafe_sign = self.rng.choice((-1, 1))
@@ -1003,7 +1079,15 @@ class Bot:
                 # no line of sight: hunt only if it is alone and we are healthy
                 others = sum(1 for e in enemies if e is not target and
                              math.hypot(e[0]["pos"][0] - tx, e[0]["pos"][1] - ty) < 150)
-                if frac > 0.6 and others == 0 and self.zone_ok(tx, ty, 0.0, 5.0):
+                if self.USE_ANCHOR and self.anchor is not None and \
+                        math.hypot(self.anchor[0] - x, self.anchor[1] - y) < 90:
+                    adx, ady = self.anchor[0] - x, self.anchor[1] - y
+                    if math.hypot(adx, ady) > 1.5:
+                        mvx, mvy = self.nav_to(x, y, z, self.anchor[0], self.anchor[1])
+                        want_boost = math.hypot(adx, ady) > 15
+                    label = "AMBUSH"
+                    self.ambush = True
+                elif frac > 0.6 and others == 0 and self.zone_ok(tx, ty, 0.0, 5.0):
                     mvx, mvy = self.nav_to(x, y, z, tx, ty)
                 else:
                     if nd > 0.55 * self.zone["next_radius"] + 5:
@@ -1079,7 +1163,13 @@ class Bot:
                 want_boost = want_boost or (dd > 70 and me["energy"] > 70)
             else:
                 ax2, ay2 = ax_, ay_
-                if nd >= 0.55 * self.zone["next_radius"] + 2:
+                if self.USE_ANCHOR and self.anchor is not None:
+                    adx, ady = self.anchor[0] - x, self.anchor[1] - y
+                    if math.hypot(adx, ady) > 1.5:
+                        mvx, mvy = self.nav_to(x, y, z, self.anchor[0], self.anchor[1])
+                        want_boost = math.hypot(adx, ady) > 90 and me["energy"] > 60
+                    label = "ANCHOR-wait"
+                elif nd >= 0.55 * self.zone["next_radius"] + 2:
                     mvx, mvy = self.nav_to(x, y, z, ax2, ay2)
                     want_boost = nd > 90 and me["energy"] > 60
                 # else: already in a good spot: stand still (silent)
@@ -1244,7 +1334,7 @@ class Bot:
                         self.laser_hold_t = None
                         self.laser_fired_t = t
                 elif lw.get("cooldown", 0) <= 0 and d < lw["stats"]["range"] * 0.95 and not self.kiting and (
-                        los_shot or self.hide is not None or (self.peek_active and self.peek["phase"] == "cover"
+                        los_shot or self.hide is not None or (getattr(self, "ambush", False) and d < 110) or (self.peek_active and self.peek["phase"] == "cover"
                                      and math.hypot(self.peek["C"][0] - x, self.peek["C"][1] - y) < 4.0)):
                     self.laser_hold_t = t
                     if li == 1:
