@@ -15,4 +15,4 @@ v7d,0c806cb,"PROBE D: v7 + shorter stall 7 cubes/110 s (v7 10/150)",
 v7e,67033d3,"PROBE E: v7 + laser duel range 170 m (v7 130)",
 v7f,2f5a17e,"PROBE F: v7 + stall at 4 kills (v7 3)",
 v8,1afab0f,"STACK: v7 + D (stall 7 cubes/110 s) + E (laser range 170 m) + F (stall at 4 kills); C excluded (lost). Sim 5.44 vs v7 5.23",4.46
-pacifist,1139e47,"PURE PACIFIST storm-win test (storm.py entrypoint): 0 kills, farm/hide/roofs/drops, final-circle centre. Sim: 0/16 storm wins under all modelled hunter behaviours; live test of whether real house bots lose a hidden silent mech",
+pacifist,1139e47,"PURE PACIFIST storm-win test (storm.py entrypoint): 0 kills, farm/hide/roofs/drops, final-circle centre. Sim: 0/16 storm wins under all modelled hunter behaviours; live test of whether real house bots lose a hidden silent mech",0.06
