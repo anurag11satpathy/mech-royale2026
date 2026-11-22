@@ -54,8 +54,8 @@ def roof_spots(geo):
 
 
 class StormBot(Bot):
-    name = "anurag-storm"
-    STORM_MODE = "hybrid"       # "pacifist" | "hybrid"  (toggle here)
+    name = "anurag-pacifist"
+    STORM_MODE = "pacifist"     # "pacifist" | "hybrid"  (toggle here)
     HYBRID_KILLS = 3
     HYBRID_T = 150.0            # hybrid also flips at this time even with fewer kills
     CUBE_GOAL = 12              # farm until this many cubes ...
