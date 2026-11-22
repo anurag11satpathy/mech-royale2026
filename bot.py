@@ -51,7 +51,7 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v7"
+    name = "anurag-v9"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
     R_LASER = 130.0      # preferred duel range with a laser
@@ -67,6 +67,10 @@ class Bot:
     STALL_T = 150.0      # ... or this much match time has passed
     FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
     HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
+    USE_LCT = True       # v9 laser-cycle timing: duck before a ready enemy laser can fire, fight in its cooldown
+    LCT_EXPO = 0.35      # seconds a ready laser hunter may see us before we duck
+    LCT_COLD = 1.7       # seconds after an enemy laser shot during which it can't fire again (1.65 cooldown)
+    LCT_MAXHIDE = 3.2    # longest duck (their full charge + 2 s hold auto-fires by ~2.75 s)
     USE_DROPS = True     # v7: go for supply drops (+3 cubes, full HP + energy) from ROAM, HEAL and DUEL
     DROP_MAX_D = 400.0
     DROP_EARLY = 12.0    # arrive at most this many seconds before it lands
@@ -125,6 +129,8 @@ class Bot:
         self.kiting = False
         self.kills = 0
         self.stalling = False
+        self.las_fire = {}          # enemy id -> last time its laser fired
+        self.expo = {}              # enemy id -> since when a READY laser hunter has had sight of us
         self.hc, self.hc_t = None, -99.0
         self.times = []
         self.n = 0
@@ -188,6 +194,32 @@ class Bot:
             return 100 + (UPGRADE_REST.index(u) if u in UPGRADE_REST else 99)
         return min(range(len(choices)), key=lambda i: rank(choices[i]))
 
+    def track_lasers(self, enemies, obs, t, x, y):
+        """Last-fire time of every laser hunter (beams, laser hits on us, laser sounds by bearing) and how long a
+        READY laser has had sight of us."""
+        for b in obs.get("beams", ()):
+            if b.get("kind") == "laser" and b.get("by") is not None:
+                self.las_fire[b["by"]] = t - b.get("age", 0.0)
+        for ev in obs.get("events", ()):
+            if ev.get("type") == "damaged" and ev.get("weapon") == "laser" and ev.get("by") is not None:
+                self.las_fire[ev["by"]] = t
+        carriers = [e for e in enemies if "laser" in (e[0].get("weapons") or ())]
+        for s_ in obs.get("sounds", ()):
+            if s_.get("kind") == "laser" and carriers:
+                e = min(carriers, key=lambda q: abs(wrap(math.atan2(q[0]["pos"][1] - y, q[0]["pos"][0] - x) - s_["bearing"])))
+                if abs(wrap(math.atan2(e[0]["pos"][1] - y, e[0]["pos"][0] - x) - s_["bearing"])) < 0.35:
+                    self.las_fire[e[0]["id"]] = t - s_.get("age", 0.0)
+        seen = set()
+        for e in carriers:
+            eid = e[0]["id"]
+            ready = t - self.las_fire.get(eid, -99.0) > self.LCT_COLD
+            if e[2] and e[1] < 285 and (ready or e[0].get("charging")):
+                self.expo.setdefault(eid, t)
+                seen.add(eid)
+        for eid in list(self.expo):
+            if eid not in seen:
+                del self.expo[eid]
+
     def find_hide(self, x, y, z, shooter, others):
         """Nearest spot within 10 m that breaks line of sight to `shooter` (and, if possible, the others)."""
         g = self.geo
@@ -222,6 +254,9 @@ class Bot:
             fired = any(b.get("by") == hd["eid"] for b in self.obs.get("beams", ())) or \
                 any(s_["kind"] == "laser" and s_.get("age", 1) < t - hd["start"] + 0.05 for s_ in self.obs.get("sounds", ()))
             dropped = em is not None and em[2] and not em[0].get("charging")
+            if self.USE_LCT:
+                fired = fired or self.las_fire.get(hd["eid"], -99.0) > hd["start"]
+                dropped = False
             if t - hd["start"] > 0.3 and (fired or dropped or t > hd["until"] or em is None):
                 self.hide = None
                 self.peek_window_until = t + 1.4   # their laser is on cooldown: our window
@@ -232,6 +267,20 @@ class Bot:
                     return 0.0, 0.0, False, "HIDE-in"
                 vx, vy = self.nav_to(x, y, z, hx, hy)
                 return vx, vy, True, "HIDE"
+        if self.USE_LCT and self.hide is None:
+            for e in enemies:
+                em = e[0]
+                since = self.expo.get(em["id"])
+                if since is None or t - since < self.LCT_EXPO:
+                    continue
+                others = [q for q in threats if abs(q[0] - em["pos"][0]) > 1 or abs(q[1] - em["pos"][1]) > 1]
+                spot = self.find_hide(x, y, z, em["pos"], others)
+                if spot is not None:
+                    self.hide = {"spot": spot, "eid": em["id"], "start": t, "until": t + self.LCT_MAXHIDE}
+                    self.expo.pop(em["id"], None)
+                    vx, vy = self.nav_to(x, y, z, spot[0], spot[1])
+                    return vx, vy, True, "DUCK"
+                break
         if t > self.peek_window_until and self.USE_HIDE:
             for e in enemies:
                 em, d, vis, _ = e
@@ -756,6 +805,8 @@ class Bot:
         threats = [(e[0]["pos"][0], e[0]["pos"][1], e[0]["pos"][2]) for e in enemies if e[1] < 260]
         threats += [(gx, gy, g.ground(gx, gy)) for (_, gx, gy) in self.ghosts]
         threats.sort(key=lambda q: (q[0] - x) ** 2 + (q[1] - y) ** 2)
+        if self.USE_LCT:
+            self.track_lasers(enemies, obs, t, x, y)
 
         # ---------------- weapons
         w0 = me["weapons"][0]
