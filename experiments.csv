@@ -4,4 +4,4 @@ v2,ed77a60,"Cover-aware healing (wall-hugging cover, own-position hidden check),
 v3,b704926,"Heal 42/55/65% + kill-finish override (never retreat from a <=2 s kill), peek only when not winning, crate/drone/rooftop loot farming, armor/plating/nanites then weapon dmg upgrades",3.88
 v4,380708a,"Focus-fire fastest kill, irregular jukes + laser-aim sidestep + stronger dodge, no laser charge when rushed, squad-adaptive loot pref, fix false-stuck mid-duel climbs; isolation built but OFF (lost in squad_sim)",3.33
 v5,4995b8e,"v3 base + laser-first (300 m detour, never drop), math upgrade plan (plating/nanites/drum mag/lens), attacker-first targeting + back-armor aim guard, end-game hold near centre; hide & kite built but OFF (no sim gain). Sim gauntlet: tie with v3",4.35
-v6,890f525,"Wave-stall (after 3 kills farm to 10 cubes/150 s before taking the 4th; never finish while stalling) + keep firing while retreating to heal. gauntlet_sim: 6.49 vs v5 5.99 kills",
+v6,890f525,"Wave-stall (after 3 kills farm to 10 cubes/150 s before taking the 4th; never finish while stalling) + keep firing while retreating to heal. gauntlet_sim: 6.49 vs v5 5.99 kills",4.67

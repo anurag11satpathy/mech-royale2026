@@ -33,11 +33,18 @@ CFG = HELLO["config"]
 GUN = CFG["weapons"]["gun"]
 LAS = CFG["weapons"]["laser"]
 LIT = CFG["weapons"]["lightning"]
+MOR = CFG["weapons"]["mortar"]
+ZCFG = CFG["zone"]
+SECONDARIES = ("laser", "lightning", "mortar")   # house bots' second weapon (loot weights 1:1:1)
 UPG = {u["id"]: u for u in CFG["upgrades"]}
 THRESH = CFG["cubes"]["upgrade_thresholds"]
 DT = 0.05
 TIERS = [("easy", 3.0, 0.7, False, 0.0, 1400.0)] * 4 + [("medium", 1.6, 0.45, True, 0.6, 1400.0)] * 4 + \
         [("hard", 1.0, 0.3, True, 0.85, 1400.0)] * 4 + [("expert", 0.8, 0.2, True, 0.9, 1600.0)] * 3
+
+
+# difficulty knobs (calibration): hunter aim spread x, reaction x, laser hit +, HP x, loot fraction
+DIFF = {"spread": 1.0, "react": 1.0, "lhit": 0.0, "hp": 1.0, "loot": 1.0}
 
 
 def WANT(t, kills, left):
@@ -129,20 +136,58 @@ class Me(Unit):
         return LAS["charge"] * (0.75 ** self.lvl("laser_charge"))
 
 
-def run_trial(mod, g, rng, max_t=300.0):
+def make_zone(rng):
+    """Real phase schedule from config; each next circle sits inside the current one."""
+    phases = []
+    c, r, t0 = list(ZCFG["start_center"]), ZCFG["start_radius"], 0.0
+    for ph in ZCFG["phases"]:
+        nr = ph["radius"]
+        a = rng.uniform(0, 2 * math.pi); off = rng.uniform(0, max(r - nr, 0) * 0.8)
+        nc = [c[0] + math.cos(a) * off, c[1] + math.sin(a) * off]
+        ss = t0 + ph["hold_s"]
+        phases.append({"center": c, "radius": r, "next_center": nc, "next_radius": nr,
+                       "shrink_start": ss, "shrink_end": ss + ph["shrink_s"], "dps": ph["dps"]})
+        c, r, t0 = nc, nr, ss + ph["shrink_s"]
+    return phases
+
+
+def zone_now(phases, t):
+    for ph in phases:
+        if t < ph["shrink_end"]:
+            break
+    f = 0.0 if t <= ph["shrink_start"] else min(1.0, (t - ph["shrink_start"]) / (ph["shrink_end"] - ph["shrink_start"]))
+    cx = ph["center"][0] + (ph["next_center"][0] - ph["center"][0]) * f
+    cy = ph["center"][1] + (ph["next_center"][1] - ph["center"][1]) * f
+    return ph, cx, cy, ph["radius"] + (ph["next_radius"] - ph["radius"]) * f
+
+
+def mortar_vel(sx, sy, sz, tx, ty, tz, high):
+    v, gg = MOR["speed"], MOR["gravity"]
+    D = math.hypot(tx - sx, ty - sy); h = tz - sz
+    disc = v ** 4 - gg * (gg * D * D + 2 * h * v * v)
+    if disc < 0 or D < 1:
+        return None
+    th = math.atan((v * v + math.sqrt(disc)) / (gg * D)) if high else math.atan((v * v - math.sqrt(disc)) / (gg * D))
+    yaw = math.atan2(ty - sy, tx - sx)
+    return [v * math.cos(th) * math.cos(yaw), v * math.cos(th) * math.sin(yaw), v * math.sin(th)]
+
+
+def run_trial(mod, g, rng, max_t=420.0, zone_on=True, secondaries=SECONDARIES):
     b = mod.Bot(HELLO)
+    zphases = make_zone(rng)
     while True:
         x, y = rng.uniform(-250, 300), rng.uniform(-150, 200)
-        if g.NAV[g.ncell(x, y)] == 1:
+        if g.NAV[g.ncell(x, y)] == 1 and (not zone_on or math.hypot(x - zphases[0]["next_center"][0],
+                                                                     y - zphases[0]["next_center"][1]) < 420):
             break
     me = Me(g, x, y)
     # ---- world
     crates, npcs, pickups, cubes = [], [], [], []
-    for i in range(23):
+    for i in range(int(round(23 * DIFF["loot"]))):
         p = ring_spot(rng, g, x, y, 25, 400, roof=(i % 4 == 0))
         if p:
             crates.append({"id": 1000 + i, "pos": list(p), "hp": 300.0})
-    for i in range(8):
+    for i in range(int(round(8 * DIFF["loot"]))):
         p = ring_spot(rng, g, x, y, 50, 400)
         if p:
             npcs.append({"id": 100 + i, "pos": list(p), "hp": 350.0, "cd": 0.0, "aggro": -99.0})
@@ -169,12 +214,16 @@ def run_trial(mod, g, rng, max_t=300.0):
 
     def spawn(tier):
         name, spm, react_s, hl, lhit, hp0 = tier
+        spm, react_s = spm * DIFF["spread"], react_s * DIFF["react"]
+        lhit, hp0 = min(0.97, lhit + DIFF["lhit"]), hp0 * DIFF["hp"]
         for _ in range(500):
             a = rng.uniform(0, 2 * math.pi); d = rng.uniform(180, 260)
             ex, ey = me.body.x + math.cos(a) * d, me.body.y + math.sin(a) * d
             if -480 < ex < 520 and -300 < ey < 360 and g.NAV[g.ncell(ex, ey)] == 1:
                 f = Unit(g, ex, ey, 20 + spawned, hp0)
-                f.tier, f.has_laser, f.lhit, f.spm, f.react_s = name, hl, lhit, spm, react_s
+                f.sec = rng.choice(secondaries) if hl else None
+                f.tier, f.has_laser, f.lhit, f.spm, f.react_s = name, f.sec == "laser", lhit, spm, react_s
+                f.energy, f.mcd = 100.0, rng.uniform(0, 2.6)
                 f.lcd, f.lcharge, f.seen_since = 0.0, 0.0, None
                 f.path, f.path_t, f.pi, f.strafe, f.strafe_t = None, -99, 0, 1, 0
                 return f
@@ -182,6 +231,7 @@ def run_trial(mod, g, rng, max_t=300.0):
 
     zone = {"center": [x, y], "radius": 560, "next_center": [x, y], "next_radius": 380,
             "shrink_start": 999, "shrink_end": 1050, "dps": 20}
+    in_zone = True
     gun = dict(BASE["self"]["weapons"][0]); gun.update(ammo=12, reload=0, cooldown=0)
     gun["stats"] = dict(gun["stats"])
     slot1 = None
@@ -193,6 +243,9 @@ def run_trial(mod, g, rng, max_t=300.0):
     kills, times = 0, []
     laser_t = None
     cubes_at_4th = None
+    short_until = -99.0
+    shells = []            # [x, y, z, vx, vy, vz, owner]
+    zone_deaths = 0
     t = 0.0
 
     def our_hit(tid, dmg, weapon):
@@ -205,8 +258,8 @@ def run_trial(mod, g, rng, max_t=300.0):
                     kills += 1
                     events.append({"type": "kill", "target": tid})
                     drop_cubes(f.pos, 2)
-                    if f.has_laser:
-                        drop_pickup(f.pos, "laser")
+                    if f.sec:
+                        drop_pickup(f.pos, f.sec)
                 return
         for n in npcs:
             if n["id"] == tid and n["hp"] > 0:
@@ -244,10 +297,12 @@ def run_trial(mod, g, rng, max_t=300.0):
             cubes_at_4th = me.cubes
         if not alive and not queue:
             return dict(res="win", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken))
+                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths,
+                        score=sum(1 for f in foes if f.hp <= 0))
         if me.hp <= 0:
             return dict(res="dead", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken))
+                        laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths,
+                        score=sum(1 for f in foes if f.hp <= 0))
         mx, my, mz = me.pos
 
         def seen_by_me(px, py, pz, h):
@@ -264,7 +319,7 @@ def run_trial(mod, g, rng, max_t=300.0):
             if t - memory.get(f.id, -99) <= 5.0:
                 mechs.append({"id": f.id, "kind": "mech", "pos": [fx, fy, fz], "vel": [f.vel[0], f.vel[1], 0],
                               "aim": [round(f.aim[0], 3), 0.0], "hp": round(f.hp), "max_hp": round(f.max_hp), "cubes": 0,
-                              "weapons": ["gun", "laser"] if f.has_laser else ["gun"],
+                              "weapons": ["gun", f.sec] if f.sec else ["gun"],
                               "charging": bool(f.lcharge > 0 and vis_now)})
         for n in npcs:
             if n["hp"] > 0:
@@ -279,6 +334,12 @@ def run_trial(mod, g, rng, max_t=300.0):
         vis_pk = [p for p in pickups if seen_by_me(*p["pos"], 0.6)]
         projs = [{"id": i, "kind": "gun", "pos": bl[:3], "vel": bl[3:6]} for i, bl in enumerate(bullets)
                  if bl[6] != me.id and math.hypot(bl[0] - mx, bl[1] - my) < 200]
+        projs += [{"id": 900 + i, "kind": "mortar", "pos": sh[:3], "vel": sh[3:6]} for i, sh in enumerate(shells)
+                  if math.hypot(sh[0] - mx, sh[1] - my) < 200]
+        if zone_on:
+            zph, zcx, zcy, zr = zone_now(zphases, t)
+            zone = {k_: zph[k_] for k_ in ("center", "radius", "next_center", "next_radius", "shrink_start", "shrink_end", "dps")}
+            in_zone = math.hypot(mx - zcx, my - zcy) <= zr
         if slot1:
             slot1["charge"] = round(charge, 2) if slot1["kind"] == "laser" else 0
             slot1["cooldown"] = max(0.0, round(slot1["cooldown"], 2))
@@ -295,7 +356,7 @@ def run_trial(mod, g, rng, max_t=300.0):
                    beams=beams, pickups=vis_pk, cubes=vis_cu, crates=vis_cr, drops=[], zone=zone, offer=offer,
                    alive=1 + len(alive) + len(queue))
         obs["self"].update(pos=[mx, my, mz], vel=[me.vel[0], me.vel[1], 0], aim=[round(me.aim[0], 4), round(me.aim[1], 4)],
-                           hp=round(me.hp), max_hp=round(me.max_hp), energy=me.body.energy, in_zone=True,
+                           hp=round(me.hp), max_hp=round(me.max_hp), energy=me.body.energy, in_zone=in_zone,
                            grounded=me.body.grounded, weapons=[gun, slot1], cubes=me.cubes,
                            upgrades=[u for u, n_ in me.taken.items() for _ in range(n_)])
         events, beams, sounds = [], [], []
@@ -352,7 +413,7 @@ def run_trial(mod, g, rng, max_t=300.0):
         if slot1 and slot1["kind"] == "laser":
             held = a["fire"][1]
             full = me.laser_charge()
-            if held and slot1["cooldown"] <= 0:
+            if held and slot1["cooldown"] <= 0 and t >= short_until:
                 charge = min(charge + 0.1, full + LAS["hold_s"])
             elif charge >= LAS["min_charge"]:
                 yaw, pit = me.aim
@@ -370,6 +431,8 @@ def run_trial(mod, g, rng, max_t=300.0):
                             best = (s_, tid)
                 if best:
                     dmg = me.laser_dmg() * min(1.0, LAS["min_frac"] + (1 - LAS["min_frac"]) * charge / full)
+                    if any(f.id == best[1] and f.sec == "mortar" for f in foes):
+                        dmg *= 1 + LAS["cookoff"]
                     our_hit(best[1], dmg, "laser"); dealt = True
                 charge, slot1["cooldown"] = 0.0, LAS["cooldown"]
             elif not held:
@@ -439,8 +502,12 @@ def run_trial(mod, g, rng, max_t=300.0):
                 if t > f.strafe_t:
                     f.strafe = rng.choice((-1, 1)); f.strafe_t = t + rng.uniform(0.6, 1.6)
                 ux, uy = (mx - fx) / d, (my - fy) / d
-                radial = max(-1.0, min(1.0, (d - 90) / 40))
+                pref = 30.0 if f.sec == "lightning" else 120.0 if f.sec == "mortar" else 90.0
+                radial = max(-1.0, min(1.0, (d - pref) / 40))
                 mvx, mvy = ux * radial - uy * f.strafe * 0.8, uy * radial + ux * f.strafe * 0.8
+            elif f.sec == "lightning" and d < 125:
+                dd = d or 1
+                mvx, mvy = (mx - fx) / dd, (my - fy) / dd          # rush straight in
             else:
                 if f.path is None or t - f.path_t > 3.0:
                     s_ = AStar(g, (fx, fy), (mx, my))
@@ -480,6 +547,31 @@ def run_trial(mod, g, rng, max_t=300.0):
                         f.lcharge, f.lcd = 0.0, LAS["cooldown"]
                 elif f.lcd <= 0 and sees and react and d < LAS["range"]:
                     f.lcharge = 0.1
+            if f.sec == "lightning":
+                if d < LIT["range"] and can_shoot and react and f.energy > LIT["energy"]:
+                    rear = abs(wrap((brg_to_me + math.pi) - me.aim[0])) > math.pi / 2
+                    dmg = LIT["damage"] * 0.4 * (1.5 if rear else 1.0) * (1 - me.armor())
+                    me.hp -= dmg; me.last_combat = t; f.energy -= LIT["energy"] * 0.4
+                    events.append({"type": "damaged", "amount": dmg, "weapon": "lightning", "by": f.id,
+                                   "bearing": brg_to_me + math.pi, "rear": rear})
+                    if slot1 and slot1["kind"] == "laser":
+                        if charge > 0:
+                            events.append({"type": "effect", "effect": "short", "by": f.id})
+                        charge, short_until = 0.0, t + LIT["short_s"]
+                    if d < 160:
+                        sounds.append({"kind": "lightning", "bearing": wrap(brg_to_me + math.pi), "dist": dist_word(d), "age": 0.05})
+                else:
+                    f.energy = min(100.0, f.energy + 1.8)
+            elif f.sec == "mortar":
+                f.mcd -= 0.1
+                if f.mcd <= 0 and 40 < d < 220 and t >= 5.0:
+                    lx, ly = mx + lagged[0] * 2.5 + rng.gauss(0, 4), my + lagged[1] * 2.5 + rng.gauss(0, 4)
+                    vel = mortar_vel(fx, fy, fz + 9.5, lx, ly, g.ground(lx, ly), high=not can_shoot)
+                    if vel:
+                        shells.append([fx, fy, fz + 9.5, vel[0], vel[1], vel[2], f.id])
+                        f.mcd = MOR["cooldown"]
+                        if d < 420:
+                            sounds.append({"kind": "mortar", "bearing": wrap(brg_to_me + math.pi), "dist": dist_word(d), "age": 0.05})
             for sub in range(2):
                 if f.reload <= 0 and f.cd <= 0 and f.ammo > 0 and can_shoot and react and d < GUN["range"] * 0.85:
                     tt = d / GUN["speed"]
@@ -531,6 +623,54 @@ def run_trial(mod, g, rng, max_t=300.0):
                 bl[0], bl[1], bl[2] = p1
                 keep.append(bl)
             bullets = keep
+        # ---- mortar shells
+        keep = []
+        for sh in shells:
+            boom = None
+            for sub in range(2):
+                p0 = (sh[0], sh[1], sh[2])
+                sh[5] -= MOR["gravity"] * DT
+                p1 = (sh[0] + sh[3] * DT, sh[1] + sh[4] * DT, sh[2] + sh[5] * DT)
+                if p1[2] <= g.surface(p1[0], p1[1], p1[2] + 1) or not g.los(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]) \
+                        or seg_hits_cyl(p0, p1, me.pos):
+                    boom = p1 if g.los(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]) else p0
+                    break
+                sh[0], sh[1], sh[2] = p1
+            if boom is None:
+                keep.append(sh)
+                continue
+            dx_, dy_ = mx - boom[0], my - boom[1]
+            hd = math.hypot(dx_, dy_)
+            dist3 = math.hypot(hd, (mz + 4.5) - boom[2])
+            if hd < 2.5 and mz - 1 <= boom[2] <= mz + 10:
+                dmg, fall = MOR["damage"], 1.0
+            elif dist3 <= MOR["splash_radius"] and g.los(boom[0], boom[1], boom[2] + 0.5, mx, my, mz + 4.5):
+                fall = 1 - (1 - MOR["splash_edge"]) * dist3 / MOR["splash_radius"]
+                dmg = MOR["splash"] * fall
+            else:
+                dmg = 0.0
+            if dmg > 0:
+                brg = math.atan2(boom[1] - my, boom[0] - mx)
+                rear = abs(wrap(brg - me.aim[0])) > math.pi / 2
+                dmg *= (1.5 if rear else 1.0) * (1 - me.armor())
+                me.hp -= dmg; me.last_combat = t
+                me.body.energy = max(0.0, me.body.energy - MOR["drain"] * fall)
+                events.append({"type": "damaged", "amount": dmg, "weapon": "mortar", "by": sh[6], "bearing": brg, "rear": rear})
+            sounds.append({"kind": "explosion", "bearing": math.atan2(boom[1] - my, boom[0] - mx), "dist": dist_word(hd), "age": 0.05})
+        shells = keep
+        # ---- zone
+        if zone_on:
+            zph, zcx, zcy, zr = zone_now(zphases, t)
+            out_me = math.hypot(mx - zcx, my - zcy) > zr
+            if out_me:
+                me.hp -= zph["dps"] * 0.1
+                me.last_combat = t
+                events.append({"type": "damaged", "amount": zph["dps"] * 0.1, "weapon": "zone", "by": None, "bearing": None})
+            for f in foes:
+                if f.hp > 0 and math.hypot(f.body.x - zcx, f.body.y - zcy) > zr:
+                    f.hp -= zph["dps"] * 0.1; f.last_combat = t
+                    if f.hp <= 0:
+                        zone_deaths += 1
         if dealt:
             me.last_combat = t
         if t - me.last_combat > me.regen_delay():
@@ -539,7 +679,8 @@ def run_trial(mod, g, rng, max_t=300.0):
             if f.hp > 0 and t - f.last_combat > 5.0:
                 f.hp = min(f.max_hp, f.hp + 4.5)
     return dict(res="timeout", kills=kills, t=t, cubes=me.cubes, laser=slot1 is not None and slot1["kind"] == "laser",
-                laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken))
+                laser_t=laser_t, c4=cubes_at_4th, times=times, ups=dict(me.taken), zd=zone_deaths,
+                        score=sum(1 for f in foes if f.hp <= 0))
 
 
 def main():
@@ -548,21 +689,38 @@ def main():
     ap.add_argument("--trials", type=int, default=30)
     ap.add_argument("--seed", type=int, default=31)
     ap.add_argument("--name", default="")
+    ap.add_argument("--no-zone", action="store_true")
+    ap.add_argument("--laser-only", action="store_true", help="hunters' secondary is always a laser (pre-v7 sim)")
+    for k_ in DIFF:
+        ap.add_argument("--" + k_, type=float, default=None)
+    ap.add_argument("--cal", action="store_true",
+                    help="live-calibrated preset: laser hunters, spread x0.8, reaction x0.8, laser hit +0.1, HP x1.4 "
+                         "(fits our 6 live scores: RMSE ~0.8-1.1, corr ~0.75-0.9)")
     ap.add_argument("overrides", nargs="*")
     args = ap.parse_args()
+    if args.cal:
+        args.laser_only = True
+        DIFF.update(spread=0.8, react=0.8, lhit=0.1, hp=1.4)
+    for k_ in DIFF:
+        if getattr(args, k_) is not None:
+            DIFF[k_] = getattr(args, k_)
     mod = load_bot(args.bot)
     for kv in args.overrides:
         k, v = kv.split("=")
         setattr(mod.Bot, k, type(getattr(mod.Bot, k))(eval(v)))
     g = mod.Geo(os.path.join(ROOT, "data", "map.bin"))
     rng = random.Random(args.seed)
-    res = [run_trial(mod, g, rng) for _ in range(args.trials)]
+    kw = {"zone_on": not args.no_zone, "secondaries": ("laser",) if args.laser_only else SECONDARIES}
+    if args.no_zone:
+        kw["max_t"] = 300.0
+    res = [run_trial(mod, g, rng, **kw) for _ in range(args.trials)]
     ks = sorted(r["kills"] for r in res)
+    sc = sorted(r["score"] for r in res)
     n = len(res)
     c4 = [r["c4"] for r in res if r["c4"] is not None]
     allt = sorted(x for r in res for x in r["times"])
     label = args.name or os.path.basename(args.bot)
-    print(f"{label:24s} kills mean {sum(ks)/n:.2f} median {ks[n//2]} best {ks[-1]} | cubes {sum(r['cubes'] for r in res)/n:4.1f}"
+    print(f"{label:24s} SCORE {sum(sc)/n:.2f} (kills {sum(ks)/n:.2f} + zone {sum(r['zd'] for r in res)/n:.2f}) median {sc[n//2]} | cubes {sum(r['cubes'] for r in res)/n:4.1f}"
           f" (at 4th kill {sum(c4)/max(len(c4),1):4.1f}) | laser {sum(r['laser'] for r in res)}/{n} | surv {sum(r['t'] for r in res)/n:4.0f}s"
           f" | tick p99 {allt[int(len(allt)*.99)]:.2f} max {allt[-1]:.1f} ms")
 
