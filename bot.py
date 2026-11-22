@@ -51,7 +51,7 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v6b"
+    name = "anurag-v6"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
     R_LASER = 130.0      # preferred duel range with a laser
@@ -63,8 +63,8 @@ class Bot:
     # v6 farming-first / wave-stalling (tuned in tools/gauntlet_sim.py)
     FARM_FIRST = True
     STALL_KILLS = 3      # once we have this many kills, don't take the next one until geared
-    CUBE_TARGET = 14     # "geared" = this many cubes ... (probe B: deep farm)
-    STALL_T = 220.0      # ... or this much match time has passed (probe B)
+    CUBE_TARGET = 10     # "geared" = this many cubes ...
+    STALL_T = 150.0      # ... or this much match time has passed
     FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
     HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
     USE_KITE = False     # split-kite vs 2+ bunched pursuers: built, 3.94 vs 4.16 kills in squad_sim gauntlet -> off
