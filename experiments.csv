@@ -8,3 +8,9 @@ v6,890f525,"Wave-stall (after 3 kills farm to 10 cubes/150 s before taking the 4
 v6a,4b88d0e,"PROBE A: v6 + early heal (HEAL_BASE 0.55, HEAL_MULTI 0.68; v6 0.42/0.55). Flag-only live test",4.46
 v6b,b29f0aa,"PROBE B (branch probe-b): v6 + deep farm (stall until 14 cubes / 220 s; v6 10 / 150 s). Flag-only live test",4.56
 v7,8dda2d2,"Supply-drop control: go for drops (+3 cubes, full HP/energy) from ROAM/HEAL/DUEL, hold the ring while fighting. Calibrated sim 5.43 vs v6 5.20",4.67
+v7(resubmit),8dda2d2,"Identical v7 resubmitted -> identical score: practice eval is deterministic (no luck to exploit; version deltas are exact)",4.67
+lightning,lightning-exp,"Lightning-primary brawl loadout: calibrated sim 4.2 vs v7 5.4 -> not submitted",
+v7c,4d89893,"PROBE C: v7 + braver heal 0.33/0.45 (v7 0.42/0.55)",
+v7d,0c806cb,"PROBE D: v7 + shorter stall 7 cubes/110 s (v7 10/150)",
+v7e,67033d3,"PROBE E: v7 + laser duel range 170 m (v7 130)",
+v7f,2f5a17e,"PROBE F: v7 + stall at 4 kills (v7 3)",
