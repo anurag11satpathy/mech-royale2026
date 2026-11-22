@@ -51,10 +51,10 @@ def clamp(v, lo, hi):
 
 
 class Bot:
-    name = "anurag-v8"
+    name = "anurag-v7"
     # tunables (squad_sim gauntlet experiments)
     USE_HIDE = False     # hide from aimed laser charges: built, neutral-to-negative in squad_sim gauntlet -> off
-    R_LASER = 170.0      # preferred duel range with a laser (v8: probe E)
+    R_LASER = 130.0      # preferred duel range with a laser
     HEAL_EXIT = 0.85     # leave HEAL at this HP fraction
     PREHEAL = 0.0        # with no enemy in sight, go heal (cover + stand still) below this HP fraction
     HEAL_BASE = 0.42     # HEAL below this HP fraction
@@ -62,9 +62,9 @@ class Bot:
     HEAL_FIRE = True     # keep shooting while retreating: +0.65 kills in gauntlet_sim (28/30 deaths were mid-retreat)
     # v6 farming-first / wave-stalling (tuned in tools/gauntlet_sim.py)
     FARM_FIRST = True
-    STALL_KILLS = 4      # once we have this many kills, don't take the next one until geared (v8: probe F)
-    CUBE_TARGET = 7      # "geared" = this many cubes ... (v8: probe D)
-    STALL_T = 110.0      # ... or this much match time has passed (v8: probe D)
+    STALL_KILLS = 3      # once we have this many kills, don't take the next one until geared
+    CUBE_TARGET = 10     # "geared" = this many cubes ...
+    STALL_T = 150.0      # ... or this much match time has passed
     FARM_UNDER_PRESSURE = True   # keep farming while one hunter is around but not close/visible
     HEAL_COVER_MAX = 0.0  # >0: only retreat to heal if cover is within this many metres (else keep fighting)
     USE_DROPS = True     # v7: go for supply drops (+3 cubes, full HP + energy) from ROAM, HEAL and DUEL

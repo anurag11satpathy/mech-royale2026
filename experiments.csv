@@ -14,4 +14,4 @@ v7c,4d89893,"PROBE C: v7 + braver heal 0.33/0.45 (v7 0.42/0.55)",4.60
 v7d,0c806cb,"PROBE D: v7 + shorter stall 7 cubes/110 s (v7 10/150)",
 v7e,67033d3,"PROBE E: v7 + laser duel range 170 m (v7 130)",
 v7f,2f5a17e,"PROBE F: v7 + stall at 4 kills (v7 3)",
-v8,1afab0f,"STACK: v7 + D (stall 7 cubes/110 s) + E (laser range 170 m) + F (stall at 4 kills); C excluded (lost). Sim 5.44 vs v7 5.23",
+v8,1afab0f,"STACK: v7 + D (stall 7 cubes/110 s) + E (laser range 170 m) + F (stall at 4 kills); C excluded (lost). Sim 5.44 vs v7 5.23",4.46
